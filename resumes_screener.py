@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Resume Analyzer — AI-Powered HR Screening Tool."""
+"""Resume Analyzer — On-Prem AI HR Screening Tool (Ollama-powered)."""
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -7,6 +7,8 @@ import threading
 import os
 import json
 import re
+import urllib.request
+import urllib.error
 from pathlib import Path
 
 # ─── Text extraction ──────────────────────────────────────────────────────────
@@ -63,7 +65,7 @@ def extract_text(path: str) -> str:
     return f"[Unsupported file type: {ext}]"
 
 
-# ─── LLM interaction ──────────────────────────────────────────────────────────
+# ─── Ollama interaction ───────────────────────────────────────────────────────
 
 ANALYSIS_PROMPT = """\
 You are an expert HR analyst. Analyse the resume against the job description below.
@@ -93,6 +95,8 @@ Rules:
 - Be specific in highlights and lowlights (3 highlights, 2 lowlights minimum)
 """
 
+OLLAMA_TIMEOUT = 600  # seconds — local LLMs can be slow on CPU
+
 
 def _strip_fences(text: str) -> str:
     text = text.strip()
@@ -101,48 +105,89 @@ def _strip_fences(text: str) -> str:
     return text.strip()
 
 
-def call_llm(model: str, api_key: str, prompt: str) -> str:
-    if "claude" in model.lower():
-        import anthropic
-        client = anthropic.Anthropic(api_key=api_key)
-        msg = client.messages.create(
-            model=model,
-            max_tokens=1024,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        return msg.content[0].text
-    else:
-        import openai
-        client = openai.OpenAI(api_key=api_key)
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=1024,
-        )
-        return resp.choices[0].message.content
+def _ollama_url(host: str, port: str, path: str) -> str:
+    host = host.strip().rstrip("/")
+    if not host.startswith(("http://", "https://")):
+        host = f"http://{host}"
+    return f"{host}:{port}{path}"
 
 
-def analyse_resume(path: str, jd_text: str, model: str, api_key: str) -> dict:
+def ollama_generate(host: str, port: str, model: str, prompt: str) -> str:
+    """Call Ollama /api/generate and return the model's text response."""
+    url = _ollama_url(host, port, "/api/generate")
+    payload = json.dumps({
+        "model": model,
+        "prompt": prompt,
+        "stream": False,
+        "format": "json",
+        "options": {"temperature": 0.2},
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=payload, headers={"Content-Type": "application/json"}, method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=OLLAMA_TIMEOUT) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Ollama HTTP {e.code}: {body}") from e
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Cannot reach Ollama at {url} — {e.reason}") from e
+    return data.get("response", "")
+
+
+def ollama_list_models(host: str, port: str) -> list[str]:
+    """Return locally available model names from Ollama, or [] on failure."""
+    url = _ollama_url(host, port, "/api/tags")
+    try:
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        return [m.get("name", "") for m in data.get("models", []) if m.get("name")]
+    except Exception:
+        return []
+
+
+def analyse_resume(path: str, jd_text: str, host: str, port: str, model: str) -> dict:
     resume_text = extract_text(path)
     prompt = ANALYSIS_PROMPT.format(jd=jd_text, resume=resume_text)
-    raw = call_llm(model, api_key, prompt)
+    raw = ollama_generate(host, port, model, prompt)
     return json.loads(_strip_fences(raw))
 
 
-# ─── Styling constants ────────────────────────────────────────────────────────
+# ─── Design tokens ────────────────────────────────────────────────────────────
 
-ACCENT       = "#1565C0"
-ACCENT_HOVER = "#1976D2"
-BG           = "#F0F4FF"
-CARD         = "#FFFFFF"
-SEL_BG       = "#C8E6C9"
-REJ_BG       = "#FFCDD2"
-ROW_EVEN     = "#EEF2FF"
-FONT_BODY    = ("Segoe UI", 10)
-FONT_BOLD    = ("Segoe UI", 10, "bold")
-FONT_TITLE   = ("Segoe UI", 15, "bold")
-FONT_SMALL   = ("Segoe UI", 9)
-FONT_MONO    = ("Consolas", 9)
+# Slate + Indigo professional palette
+PRIMARY       = "#0F172A"   # slate-900   (header background)
+PRIMARY_SOFT  = "#1E293B"   # slate-800
+ACCENT        = "#4F46E5"   # indigo-600  (primary action)
+ACCENT_HOVER  = "#4338CA"   # indigo-700
+ACCENT_DEEP   = "#3730A3"   # indigo-800
+ACCENT_LIGHT  = "#EEF2FF"   # indigo-50
+BG            = "#F1F5F9"   # slate-100
+CARD          = "#FFFFFF"
+BORDER        = "#E2E8F0"   # slate-200
+BORDER_DARK   = "#CBD5E1"   # slate-300
+TEXT          = "#0F172A"
+TEXT_MUTED    = "#475569"   # slate-600
+TEXT_SUBTLE   = "#94A3B8"   # slate-400
+SUCCESS       = "#047857"   # emerald-700
+SUCCESS_BG    = "#D1FAE5"   # emerald-100
+DANGER        = "#B91C1C"   # red-700
+DANGER_BG     = "#FEE2E2"   # red-100
+NEUTRAL_BTN   = "#F1F5F9"
+NEUTRAL_HOVER = "#E2E8F0"
+ROW_ALT       = "#F8FAFC"   # slate-50
+
+FONT_FAMILY  = "Segoe UI"
+FONT_TITLE   = (FONT_FAMILY, 17, "bold")
+FONT_SUB     = (FONT_FAMILY, 10)
+FONT_SECTION = (FONT_FAMILY, 11, "bold")
+FONT_BODY    = (FONT_FAMILY, 10)
+FONT_BOLD    = (FONT_FAMILY, 10, "bold")
+FONT_LABEL   = (FONT_FAMILY, 9, "bold")
+FONT_SMALL   = (FONT_FAMILY, 9)
+FONT_MICRO   = (FONT_FAMILY, 8)
+FONT_MONO    = ("Consolas", 10)
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -162,12 +207,15 @@ class ToolTip:
 
     def _show(self, widget, text):
         x = widget.winfo_rootx() + 20
-        y = widget.winfo_rooty() + widget.winfo_height() + 4
+        y = widget.winfo_rooty() + widget.winfo_height() + 6
         self.tip = tk.Toplevel(widget)
         self.tip.wm_overrideredirect(True)
         self.tip.wm_geometry(f"+{x}+{y}")
-        tk.Label(self.tip, text=text, bg="#FFFDE7", relief="solid",
-                 borderwidth=1, font=FONT_SMALL, padx=4, pady=2).pack()
+        tk.Label(
+            self.tip, text=text, bg=PRIMARY_SOFT, fg="white",
+            relief="flat", borderwidth=0, font=FONT_SMALL,
+            padx=8, pady=5,
+        ).pack()
 
     def _hide(self):
         if self.tip:
@@ -175,55 +223,148 @@ class ToolTip:
             self.tip = None
 
 
+class HoverButton(tk.Button):
+    """Flat button with controlled hover/press colors."""
+    def __init__(self, parent, text, command, *,
+                 bg=ACCENT, fg="white", hover=ACCENT_HOVER,
+                 font=FONT_BODY, padx=14, pady=7, **kw):
+        super().__init__(
+            parent, text=text, command=command, font=font,
+            bg=bg, fg=fg, activebackground=hover, activeforeground=fg,
+            relief="flat", borderwidth=0, padx=padx, pady=pady,
+            cursor="hand2", highlightthickness=0, **kw,
+        )
+        self._bg, self._hv = bg, hover
+        self.bind("<Enter>", lambda _: self.config(bg=self._hv))
+        self.bind("<Leave>", lambda _: self.config(bg=self._bg))
+
+
 # ─── Main application ─────────────────────────────────────────────────────────
 
 class ResumeAnalyzerApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Resume Analyzer — AI-Powered HR Tool")
-        self.geometry("1280x820")
-        self.minsize(960, 640)
+        self.title("Resume Analyzer — On-Prem AI HR Tool")
+        self.geometry("1320x860")
+        self.minsize(1000, 660)
         self.configure(bg=BG)
         self.resume_files: list[str] = []
         self.results: list[dict] = []
-        self._build_ui()
         self._apply_style()
+        self._build_ui()
 
     # ── Style ─────────────────────────────────────────────────────────────────
 
     def _apply_style(self):
         s = ttk.Style(self)
         s.theme_use("clam")
-        s.configure("TEntry", fieldbackground="white", relief="flat", padding=4)
-        s.configure("TScrollbar", troughcolor=BG, background="#BDBDBD")
-        s.configure("Results.Treeview",
-                    rowheight=56, font=FONT_SMALL,
-                    background="white", fieldbackground="white")
-        s.configure("Results.Treeview.Heading",
-                    font=FONT_BOLD, background=ACCENT, foreground="white",
-                    relief="flat", padding=6)
-        s.map("Results.Treeview.Heading", background=[("active", ACCENT_HOVER)])
-        s.map("Results.Treeview", background=[("selected", "#BBDEFB")])
-        s.configure("Accent.TButton", background=ACCENT, foreground="white",
-                    font=FONT_BOLD, padding=8, relief="flat")
-        s.map("Accent.TButton",
-              background=[("active", ACCENT_HOVER), ("disabled", "#90A4AE")])
+
+        s.configure(
+            "TEntry",
+            fieldbackground="white", background="white",
+            bordercolor=BORDER, lightcolor=BORDER, darkcolor=BORDER,
+            relief="flat", padding=8, foreground=TEXT,
+        )
+        s.map(
+            "TEntry",
+            bordercolor=[("focus", ACCENT)],
+            lightcolor=[("focus", ACCENT)],
+            darkcolor=[("focus", ACCENT)],
+        )
+
+        s.configure(
+            "TCombobox",
+            fieldbackground="white", background="white",
+            bordercolor=BORDER, lightcolor=BORDER, darkcolor=BORDER,
+            relief="flat", padding=6, foreground=TEXT,
+            arrowcolor=TEXT_MUTED,
+        )
+        s.map("TCombobox",
+              fieldbackground=[("readonly", "white")],
+              bordercolor=[("focus", ACCENT)])
+
+        s.configure("Vertical.TScrollbar",
+                    troughcolor=BG, background=BORDER_DARK,
+                    bordercolor=BG, arrowcolor=TEXT_MUTED,
+                    relief="flat")
+        s.configure("Horizontal.TScrollbar",
+                    troughcolor=BG, background=BORDER_DARK,
+                    bordercolor=BG, arrowcolor=TEXT_MUTED,
+                    relief="flat")
+
+        s.configure(
+            "Results.Treeview",
+            rowheight=58, font=FONT_SMALL,
+            background="white", fieldbackground="white",
+            foreground=TEXT, bordercolor=BORDER,
+            relief="flat",
+        )
+        s.configure(
+            "Results.Treeview.Heading",
+            font=FONT_BOLD, background=PRIMARY, foreground="white",
+            relief="flat", padding=10, borderwidth=0,
+        )
+        s.map("Results.Treeview.Heading",
+              background=[("active", PRIMARY_SOFT)])
+        s.map("Results.Treeview",
+              background=[("selected", ACCENT_LIGHT)],
+              foreground=[("selected", TEXT)])
+
+        s.configure(
+            "Modern.Horizontal.TProgressbar",
+            troughcolor=BORDER, background=ACCENT,
+            bordercolor=BORDER, lightcolor=ACCENT, darkcolor=ACCENT,
+            thickness=8,
+        )
 
     # ── Layout ────────────────────────────────────────────────────────────────
 
     def _build_ui(self):
-        # Title bar
-        hdr = tk.Frame(self, bg=ACCENT, height=58)
-        hdr.pack(fill="x")
-        hdr.pack_propagate(False)
-        tk.Label(hdr, text="  Resume Analyzer", font=FONT_TITLE,
-                 bg=ACCENT, fg="white").pack(side="left", pady=12)
-        tk.Label(hdr, text="AI-Powered HR Screening Tool",
-                 font=FONT_BODY, bg=ACCENT, fg="#90CAF9").pack(side="left", padx=6)
+        self._build_header()
+        self._build_scroll_area()
 
-        # Scrollable main area
-        canvas = tk.Canvas(self, bg=BG, highlightthickness=0)
-        vscroll = ttk.Scrollbar(self, orient="vertical", command=canvas.yview)
+        self._build_config_card()
+        self._build_jd_card()
+        self._build_resumes_card()
+        self._build_action_row()
+        self._build_results_card()
+
+        self._build_footer()
+
+    def _build_header(self):
+        hdr = tk.Frame(self, bg=PRIMARY, height=72)
+        hdr.pack(fill="x", side="top")
+        hdr.pack_propagate(False)
+
+        left = tk.Frame(hdr, bg=PRIMARY)
+        left.pack(side="left", padx=24, fill="y")
+
+        tk.Label(left, text="◆", font=(FONT_FAMILY, 22, "bold"),
+                 bg=PRIMARY, fg=ACCENT).pack(side="left", pady=18, padx=(0, 10))
+
+        title_col = tk.Frame(left, bg=PRIMARY)
+        title_col.pack(side="left", pady=14)
+        tk.Label(title_col, text="Resume Analyzer", font=FONT_TITLE,
+                 bg=PRIMARY, fg="white").pack(anchor="w")
+        tk.Label(title_col, text="On-Prem AI HR Screening · Ollama",
+                 font=FONT_SUB, bg=PRIMARY, fg=TEXT_SUBTLE).pack(anchor="w")
+
+        right = tk.Frame(hdr, bg=PRIMARY)
+        right.pack(side="right", padx=24, fill="y")
+
+        self._status_dot = tk.Label(right, text="●", font=(FONT_FAMILY, 12),
+                                    bg=PRIMARY, fg=TEXT_SUBTLE)
+        self._status_dot.pack(side="left", pady=24)
+        self._status_lbl = tk.Label(right, text="Not connected",
+                                    font=FONT_SMALL, bg=PRIMARY, fg=TEXT_SUBTLE)
+        self._status_lbl.pack(side="left", padx=(6, 0), pady=24)
+
+    def _build_scroll_area(self):
+        outer = tk.Frame(self, bg=BG)
+        outer.pack(fill="both", expand=True)
+
+        canvas = tk.Canvas(outer, bg=BG, highlightthickness=0)
+        vscroll = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
         canvas.configure(yscrollcommand=vscroll.set)
         vscroll.pack(side="right", fill="y")
         canvas.pack(side="left", fill="both", expand=True)
@@ -231,7 +372,7 @@ class ResumeAnalyzerApp(tk.Tk):
         self._main = tk.Frame(canvas, bg=BG)
         win_id = canvas.create_window((0, 0), window=self._main, anchor="nw")
 
-        def _on_configure(e):
+        def _on_configure(_e):
             canvas.configure(scrollregion=canvas.bbox("all"))
         def _on_canvas_resize(e):
             canvas.itemconfig(win_id, width=e.width)
@@ -241,155 +382,270 @@ class ResumeAnalyzerApp(tk.Tk):
         canvas.bind_all("<MouseWheel>",
                         lambda e: canvas.yview_scroll(-1*(e.delta//120), "units"))
 
-        pad = {"padx": 16, "pady": 6}
+    def _build_footer(self):
+        ft = tk.Frame(self, bg=PRIMARY_SOFT, height=28)
+        ft.pack(fill="x", side="bottom")
+        ft.pack_propagate(False)
+        tk.Label(ft, text="On-prem · No data leaves your network",
+                 font=FONT_MICRO, bg=PRIMARY_SOFT,
+                 fg=TEXT_SUBTLE).pack(side="left", padx=24, pady=6)
+        tk.Label(ft, text="v2.0 · Ollama backend",
+                 font=FONT_MICRO, bg=PRIMARY_SOFT,
+                 fg=TEXT_SUBTLE).pack(side="right", padx=24, pady=6)
 
-        self._build_config_card(**pad)
-        self._build_jd_card(**pad)
-        self._build_resumes_card(**pad)
-        self._build_action_row(**pad)
-        self._build_results_card(padx=16, pady=(0, 16))
+    # ── Card primitives ───────────────────────────────────────────────────────
 
-    def _card(self, title: str) -> tk.Frame:
-        outer = tk.Frame(self._main, bg=CARD,
-                         highlightbackground="#C5CAE9", highlightthickness=1)
-        outer.pack(fill="x", padx=16, pady=6)
-        tk.Label(outer, text=title, font=FONT_BOLD,
-                 bg=CARD, fg=ACCENT).pack(anchor="w", padx=12, pady=(8, 2))
-        ttk.Separator(outer, orient="horizontal").pack(fill="x", padx=12, pady=(0, 4))
-        return outer
+    def _card(self, title: str, subtitle: str = "") -> tk.Frame:
+        # Outer creates a soft "shadow" border feel via two-tone padding
+        wrapper = tk.Frame(self._main, bg=BG)
+        wrapper.pack(fill="x", padx=24, pady=10)
 
-    def _flat_btn(self, parent, text, command, primary=True, **kw):
-        bg = ACCENT if primary else "#E3E8F8"
-        fg = "white" if primary else "#333"
-        hv = ACCENT_HOVER if primary else "#C5CAE9"
-        b = tk.Button(parent, text=text, command=command,
-                      font=FONT_SMALL, bg=bg, fg=fg,
-                      activebackground=hv, activeforeground=fg,
-                      relief="flat", padx=10, pady=4, cursor="hand2", **kw)
-        b.bind("<Enter>", lambda _: b.config(bg=hv))
-        b.bind("<Leave>", lambda _: b.config(bg=bg))
-        return b
+        outer = tk.Frame(wrapper, bg=CARD,
+                         highlightbackground=BORDER, highlightthickness=1)
+        outer.pack(fill="x")
 
-    # ── Config card ───────────────────────────────────────────────────────────
+        head = tk.Frame(outer, bg=CARD)
+        head.pack(fill="x", padx=20, pady=(14, 4))
+        tk.Label(head, text=title, font=FONT_SECTION,
+                 bg=CARD, fg=TEXT).pack(anchor="w")
+        if subtitle:
+            tk.Label(head, text=subtitle, font=FONT_SMALL,
+                     bg=CARD, fg=TEXT_MUTED).pack(anchor="w", pady=(2, 0))
 
-    def _build_config_card(self, **pad):
-        card = self._card("Configuration")
-        row = tk.Frame(card, bg=CARD)
-        row.pack(fill="x", padx=12, pady=8)
+        sep = tk.Frame(outer, bg=BORDER, height=1)
+        sep.pack(fill="x", padx=20, pady=(8, 0))
 
-        tk.Label(row, text="LLM Model:", font=FONT_BOLD,
-                 bg=CARD, width=12, anchor="w").pack(side="left")
-        self.model_var = tk.StringVar(value="claude-sonnet-4-6")
-        me = ttk.Entry(row, textvariable=self.model_var, width=30, font=FONT_BODY)
-        me.pack(side="left", padx=(0, 24))
-        ToolTip(me, "Claude: claude-sonnet-4-6, claude-opus-4-7\nOpenAI: gpt-4o, gpt-4-turbo")
+        body = tk.Frame(outer, bg=CARD)
+        body.pack(fill="x", padx=20, pady=(10, 16))
+        return body
 
-        tk.Label(row, text="API Key:", font=FONT_BOLD,
-                 bg=CARD, width=8, anchor="w").pack(side="left")
-        self.apikey_var = tk.StringVar()
-        self._key_entry = ttk.Entry(row, textvariable=self.apikey_var,
-                                    width=48, show="•", font=FONT_MONO)
-        self._key_entry.pack(side="left", padx=(0, 8))
-        self._show_key = tk.BooleanVar(value=False)
-        tk.Checkbutton(row, text="Show", variable=self._show_key,
-                       bg=CARD, font=FONT_SMALL,
-                       command=lambda: self._key_entry.config(
-                           show="" if self._show_key.get() else "•")
-                       ).pack(side="left")
+    def _label(self, parent, text):
+        return tk.Label(parent, text=text, font=FONT_LABEL,
+                        bg=CARD, fg=TEXT_MUTED)
+
+    # ── Config card (Ollama) ──────────────────────────────────────────────────
+
+    def _build_config_card(self):
+        body = self._card(
+            "Ollama Connection",
+            "Configure the on-prem Ollama endpoint serving your enterprise LLM.",
+        )
+
+        grid = tk.Frame(body, bg=CARD)
+        grid.pack(fill="x")
+
+        # Row 1: host, port, test
+        self._label(grid, "HOST / IP").grid(row=0, column=0, sticky="w", padx=(0, 6))
+        self._label(grid, "PORT").grid(row=0, column=1, sticky="w", padx=6)
+        self._label(grid, "MODEL").grid(row=0, column=2, sticky="w", padx=6)
+
+        self.host_var  = tk.StringVar(value="localhost")
+        self.port_var  = tk.StringVar(value="11434")
+        self.model_var = tk.StringVar(value="llama3.1")
+
+        host_e = ttk.Entry(grid, textvariable=self.host_var, width=22, font=FONT_BODY)
+        host_e.grid(row=1, column=0, sticky="we", padx=(0, 6), pady=(2, 0))
+        ToolTip(host_e, "Examples:  localhost  ·  10.0.0.42  ·  ollama.intra")
+
+        port_e = ttk.Entry(grid, textvariable=self.port_var, width=8, font=FONT_BODY)
+        port_e.grid(row=1, column=1, sticky="we", padx=6, pady=(2, 0))
+        ToolTip(port_e, "Default Ollama port is 11434")
+
+        self._model_combo = ttk.Combobox(
+            grid, textvariable=self.model_var, font=FONT_BODY,
+            values=["llama3.1", "llama3", "mistral", "qwen2.5", "phi3"],
+            width=24,
+        )
+        self._model_combo.grid(row=1, column=2, sticky="we", padx=6, pady=(2, 0))
+        ToolTip(self._model_combo, "Type the exact model name pulled in Ollama,\n"
+                                   "or click Refresh to fetch the list.")
+
+        btns = tk.Frame(grid, bg=CARD)
+        btns.grid(row=1, column=3, sticky="w", padx=(10, 0), pady=(2, 0))
+
+        HoverButton(btns, "↻  Refresh Models",
+                    self._refresh_models, bg=NEUTRAL_BTN, fg=TEXT,
+                    hover=NEUTRAL_HOVER, font=FONT_SMALL,
+                    padx=10, pady=6).pack(side="left", padx=(0, 6))
+        HoverButton(btns, "✓  Test Connection",
+                    self._test_connection, bg=ACCENT, hover=ACCENT_HOVER,
+                    font=FONT_BOLD, padx=14, pady=6).pack(side="left")
+
+        for col, w in enumerate([3, 1, 3, 4]):
+            grid.grid_columnconfigure(col, weight=w)
+
+        # Hint line
+        hint = tk.Frame(body, bg=CARD)
+        hint.pack(fill="x", pady=(12, 0))
+        tk.Label(hint, text="🔒",
+                 font=(FONT_FAMILY, 10), bg=CARD,
+                 fg=ACCENT).pack(side="left", padx=(0, 6))
+        tk.Label(hint,
+                 text="All inference happens inside your network. "
+                      "No API keys, no external calls.",
+                 font=FONT_SMALL, bg=CARD,
+                 fg=TEXT_MUTED).pack(side="left")
 
     # ── JD card ───────────────────────────────────────────────────────────────
 
-    def _build_jd_card(self, **pad):
-        card = self._card("Job Description")
-        row = tk.Frame(card, bg=CARD)
-        row.pack(fill="x", padx=12, pady=8)
+    def _build_jd_card(self):
+        body = self._card(
+            "Job Description",
+            "Pick the role spec to evaluate every resume against.",
+        )
+
+        row = tk.Frame(body, bg=CARD)
+        row.pack(fill="x")
 
         self.jd_var = tk.StringVar()
-        jd_entry = ttk.Entry(row, textvariable=self.jd_var, width=72, font=FONT_SMALL)
-        jd_entry.pack(side="left", padx=(0, 8))
-        ToolTip(jd_entry, "Supported: PDF, DOCX, PPTX, TXT")
-        self._flat_btn(row, "Browse…", self._browse_jd).pack(side="left")
+        jd_entry = ttk.Entry(row, textvariable=self.jd_var, font=FONT_BODY)
+        jd_entry.pack(side="left", fill="x", expand=True, padx=(0, 10), ipady=2)
+        ToolTip(jd_entry, "Supported formats: PDF · DOCX · PPTX · TXT")
+
+        HoverButton(row, "📂  Browse File", self._browse_jd,
+                    bg=NEUTRAL_BTN, fg=TEXT, hover=NEUTRAL_HOVER,
+                    font=FONT_BOLD, padx=14, pady=7).pack(side="left")
 
     # ── Resumes card ──────────────────────────────────────────────────────────
 
-    def _build_resumes_card(self, **pad):
-        card = self._card("Resumes")
+    def _build_resumes_card(self):
+        body = self._card(
+            "Resumes",
+            "Add the candidate documents you want to screen.",
+        )
 
-        btn_row = tk.Frame(card, bg=CARD)
-        btn_row.pack(fill="x", padx=12, pady=(4, 6))
-        self._flat_btn(btn_row, "+ Add Resumes", self._add_resumes).pack(side="left", padx=(0, 8))
-        self._flat_btn(btn_row, "Remove Selected", self._remove_selected,
-                       primary=False).pack(side="left", padx=(0, 8))
-        self._flat_btn(btn_row, "Clear All", self._clear_resumes,
-                       primary=False).pack(side="left")
-        self._count_lbl = tk.Label(btn_row, text="No files added",
-                                   font=FONT_SMALL, bg=CARD, fg="#555")
-        self._count_lbl.pack(side="left", padx=16)
+        btn_row = tk.Frame(body, bg=CARD)
+        btn_row.pack(fill="x", pady=(0, 10))
 
-        list_frame = tk.Frame(card, bg=CARD)
-        list_frame.pack(fill="x", padx=12, pady=(0, 10))
-        self._listbox = tk.Listbox(list_frame, height=5, font=FONT_SMALL,
-                                   bg="#F8F9FE", relief="flat", borderwidth=1,
-                                   selectmode="extended", activestyle="none",
-                                   highlightbackground="#C5CAE9", highlightthickness=1)
-        sb = ttk.Scrollbar(list_frame, orient="vertical", command=self._listbox.yview)
+        HoverButton(btn_row, "＋  Add Resumes", self._add_resumes,
+                    bg=ACCENT, hover=ACCENT_HOVER,
+                    font=FONT_BOLD, padx=14, pady=7).pack(side="left", padx=(0, 8))
+        HoverButton(btn_row, "−  Remove Selected", self._remove_selected,
+                    bg=NEUTRAL_BTN, fg=TEXT, hover=NEUTRAL_HOVER,
+                    font=FONT_SMALL, padx=12, pady=7).pack(side="left", padx=(0, 8))
+        HoverButton(btn_row, "✕  Clear All", self._clear_resumes,
+                    bg=NEUTRAL_BTN, fg=TEXT, hover=NEUTRAL_HOVER,
+                    font=FONT_SMALL, padx=12, pady=7).pack(side="left")
+
+        self._count_pill = tk.Label(
+            btn_row, text="0 files",
+            font=FONT_BOLD, bg=ACCENT_LIGHT, fg=ACCENT_DEEP,
+            padx=10, pady=4,
+        )
+        self._count_pill.pack(side="right")
+
+        list_wrap = tk.Frame(body, bg=BORDER, padx=1, pady=1)
+        list_wrap.pack(fill="x")
+        list_inner = tk.Frame(list_wrap, bg=CARD)
+        list_inner.pack(fill="both", expand=True)
+
+        self._listbox = tk.Listbox(
+            list_inner, height=6, font=FONT_BODY,
+            bg=CARD, fg=TEXT,
+            relief="flat", borderwidth=0,
+            selectmode="extended", activestyle="none",
+            selectbackground=ACCENT_LIGHT, selectforeground=TEXT,
+            highlightthickness=0,
+        )
+        sb = ttk.Scrollbar(list_inner, orient="vertical",
+                           command=self._listbox.yview)
         self._listbox.configure(yscrollcommand=sb.set)
-        self._listbox.pack(side="left", fill="x", expand=True)
+        self._listbox.pack(side="left", fill="both", expand=True, padx=4, pady=4)
         sb.pack(side="right", fill="y")
 
     # ── Action row ────────────────────────────────────────────────────────────
 
-    def _build_action_row(self, **pad):
-        row = tk.Frame(self._main, bg=BG)
-        row.pack(fill="x", padx=16, pady=4)
+    def _build_action_row(self):
+        wrapper = tk.Frame(self._main, bg=BG)
+        wrapper.pack(fill="x", padx=24, pady=(4, 10))
 
-        self._analyse_btn = tk.Button(
-            row, text="▶  Provide Summary",
-            font=("Segoe UI", 12, "bold"), bg=ACCENT, fg="white",
-            activebackground=ACCENT_HOVER, activeforeground="white",
-            relief="flat", padx=28, pady=10, cursor="hand2",
-            command=self._start_analysis,
+        card = tk.Frame(wrapper, bg=CARD,
+                        highlightbackground=BORDER, highlightthickness=1)
+        card.pack(fill="x")
+
+        inner = tk.Frame(card, bg=CARD)
+        inner.pack(fill="x", padx=20, pady=14)
+
+        self._analyse_btn = HoverButton(
+            inner, "▶  Run Analysis", self._start_analysis,
+            bg=ACCENT, hover=ACCENT_HOVER,
+            font=(FONT_FAMILY, 12, "bold"),
+            padx=28, pady=12,
         )
-        self._analyse_btn.pack(side="left", padx=(0, 16))
+        self._analyse_btn.pack(side="left", padx=(0, 18))
 
-        progress_col = tk.Frame(row, bg=BG)
+        progress_col = tk.Frame(inner, bg=CARD)
         progress_col.pack(side="left", fill="x", expand=True)
-        self._progress_lbl = tk.Label(progress_col, text="",
-                                      font=FONT_SMALL, bg=BG, fg="#444")
+
+        self._progress_lbl = tk.Label(progress_col, text="Idle — ready to analyse",
+                                      font=FONT_SMALL, bg=CARD, fg=TEXT_MUTED)
         self._progress_lbl.pack(anchor="w")
-        self._progress = ttk.Progressbar(progress_col, mode="determinate", length=500)
-        self._progress.pack(anchor="w", pady=(2, 0))
+
+        self._progress = ttk.Progressbar(
+            progress_col, mode="determinate", length=600,
+            style="Modern.Horizontal.TProgressbar",
+        )
+        self._progress.pack(anchor="w", pady=(6, 0), fill="x", expand=True)
 
     # ── Results card ──────────────────────────────────────────────────────────
 
-    def _build_results_card(self, **pad):
-        card = self._card("Analysis Results")
-        card.pack(fill="both", expand=True, **pad)
+    def _build_results_card(self):
+        wrapper = tk.Frame(self._main, bg=BG)
+        wrapper.pack(fill="both", expand=True, padx=24, pady=(0, 18))
+
+        card = tk.Frame(wrapper, bg=CARD,
+                        highlightbackground=BORDER, highlightthickness=1)
+        card.pack(fill="both", expand=True)
+
+        head = tk.Frame(card, bg=CARD)
+        head.pack(fill="x", padx=20, pady=(14, 4))
+        tk.Label(head, text="Analysis Results", font=FONT_SECTION,
+                 bg=CARD, fg=TEXT).pack(anchor="w")
+        tk.Label(head, text="Double-click a row to view full candidate detail.",
+                 font=FONT_SMALL, bg=CARD, fg=TEXT_MUTED).pack(anchor="w",
+                                                               pady=(2, 0))
+
+        sep = tk.Frame(card, bg=BORDER, height=1)
+        sep.pack(fill="x", padx=20, pady=(8, 0))
 
         export_row = tk.Frame(card, bg=CARD)
-        export_row.pack(fill="x", padx=12, pady=(0, 6))
-        self._flat_btn(export_row, "Export to Excel (.xlsx)",
-                       self._export_excel).pack(side="right", padx=(8, 0))
-        self._flat_btn(export_row, "Export to CSV",
-                       self._export_csv, primary=False).pack(side="right")
-        tk.Label(export_row,
-                 text="Double-click a row to view full details",
-                 font=FONT_SMALL, bg=CARD, fg="#777").pack(side="left")
+        export_row.pack(fill="x", padx=20, pady=10)
+
+        self._summary_lbl = tk.Label(
+            export_row, text="No analysis run yet",
+            font=FONT_SMALL, bg=CARD, fg=TEXT_MUTED,
+        )
+        self._summary_lbl.pack(side="left")
+
+        HoverButton(export_row, "⬇  Export Excel",
+                    self._export_excel,
+                    bg=ACCENT, hover=ACCENT_HOVER,
+                    font=FONT_BOLD, padx=14, pady=7
+                    ).pack(side="right", padx=(8, 0))
+        HoverButton(export_row, "⬇  Export CSV",
+                    self._export_csv,
+                    bg=NEUTRAL_BTN, fg=TEXT, hover=NEUTRAL_HOVER,
+                    font=FONT_SMALL, padx=12, pady=7
+                    ).pack(side="right")
 
         cols = ("#", "Name", "Total Exp.", "Relevant Exp.",
                 "Highlights", "Lowlights", "Score", "Decision")
-        widths = (36, 160, 90, 95, 280, 220, 52, 78)
+        widths = (40, 180, 100, 110, 320, 260, 70, 100)
 
         tframe = tk.Frame(card, bg=CARD)
-        tframe.pack(fill="both", expand=True, padx=12, pady=(0, 10))
+        tframe.pack(fill="both", expand=True, padx=20, pady=(0, 16))
 
-        self.tree = ttk.Treeview(tframe, columns=cols, show="headings",
-                                  style="Results.Treeview", selectmode="browse")
+        self.tree = ttk.Treeview(
+            tframe, columns=cols, show="headings",
+            style="Results.Treeview", selectmode="browse",
+        )
         for col, w in zip(cols, widths):
             anchor = "center" if col in ("#", "Score", "Decision") else "w"
             self.tree.heading(col, text=col)
-            self.tree.column(col, width=w, anchor=anchor,
-                             stretch=(col in ("Highlights", "Lowlights")))
+            self.tree.column(
+                col, width=w, anchor=anchor,
+                stretch=(col in ("Highlights", "Lowlights")),
+            )
 
         vsb = ttk.Scrollbar(tframe, orient="vertical", command=self.tree.yview)
         hsb = ttk.Scrollbar(tframe, orient="horizontal", command=self.tree.xview)
@@ -400,11 +656,72 @@ class ResumeAnalyzerApp(tk.Tk):
         tframe.grid_rowconfigure(0, weight=1)
         tframe.grid_columnconfigure(0, weight=1)
 
-        self.tree.tag_configure("select", background=SEL_BG)
-        self.tree.tag_configure("reject", background=REJ_BG)
-        self.tree.tag_configure("even",   background=ROW_EVEN)
+        self.tree.tag_configure("select", background=SUCCESS_BG, foreground=TEXT)
+        self.tree.tag_configure("reject", background=DANGER_BG,  foreground=TEXT)
+        self.tree.tag_configure("even",   background=ROW_ALT)
 
         self.tree.bind("<Double-1>", self._show_detail)
+
+    # ── Connection helpers ────────────────────────────────────────────────────
+
+    def _set_status(self, ok: bool | None, text: str):
+        color = TEXT_SUBTLE if ok is None else (
+            "#22C55E" if ok else "#EF4444"
+        )
+        self._status_dot.config(fg=color)
+        self._status_lbl.config(text=text, fg="white" if ok else TEXT_SUBTLE)
+
+    def _refresh_models(self):
+        host, port = self.host_var.get(), self.port_var.get()
+        models = ollama_list_models(host, port)
+        if models:
+            self._model_combo["values"] = models
+            if self.model_var.get() not in models:
+                self.model_var.set(models[0])
+            self._set_status(True, f"Connected · {len(models)} model(s)")
+            messagebox.showinfo(
+                "Models Refreshed",
+                f"Found {len(models)} model(s) on {host}:{port}:\n\n"
+                + "\n".join(f"• {m}" for m in models),
+            )
+        else:
+            self._set_status(False, "Unreachable")
+            messagebox.showwarning(
+                "No Models",
+                f"Could not reach Ollama at {host}:{port}, or no models pulled.\n\n"
+                "Verify the host/port and that `ollama serve` is running.",
+            )
+
+    def _test_connection(self):
+        host, port, model = (
+            self.host_var.get(), self.port_var.get(), self.model_var.get()
+        )
+        models = ollama_list_models(host, port)
+        if not models:
+            self._set_status(False, "Unreachable")
+            messagebox.showerror(
+                "Connection Failed",
+                f"Cannot reach Ollama at {host}:{port}.\n\n"
+                "Check the address, firewall rules, and that the Ollama "
+                "service is running on the target host.",
+            )
+            return
+        if model not in models:
+            self._set_status(True, f"Connected · model missing")
+            messagebox.showwarning(
+                "Model Not Found",
+                f"Connected to Ollama at {host}:{port}, but model "
+                f"'{model}' is not pulled.\n\nAvailable models:\n"
+                + "\n".join(f"• {m}" for m in models)
+                + f"\n\nRun on the server:\n  ollama pull {model}",
+            )
+            return
+        self._set_status(True, f"Connected · {model}")
+        messagebox.showinfo(
+            "Connection OK",
+            f"Successfully connected to Ollama at {host}:{port}.\n\n"
+            f"Model '{model}' is ready.",
+        )
 
     # ── Event handlers ────────────────────────────────────────────────────────
 
@@ -428,7 +745,7 @@ class ResumeAnalyzerApp(tk.Tk):
         for p in paths:
             if p not in self.resume_files:
                 self.resume_files.append(p)
-                self._listbox.insert("end", os.path.basename(p))
+                self._listbox.insert("end", "  " + os.path.basename(p))
         self._update_count()
 
     def _clear_resumes(self):
@@ -444,11 +761,18 @@ class ResumeAnalyzerApp(tk.Tk):
 
     def _update_count(self):
         n = len(self.resume_files)
-        self._count_lbl.config(
-            text=f"{n} file{'s' if n != 1 else ''} added" if n else "No files added"
-        )
+        self._count_pill.config(text=f"{n} file{'s' if n != 1 else ''}")
 
     def _validate(self) -> bool:
+        if not self.host_var.get().strip():
+            messagebox.showwarning("Missing Input", "Please enter the Ollama host or IP.")
+            return False
+        if not self.port_var.get().strip().isdigit():
+            messagebox.showwarning("Invalid Input", "Port must be a number.")
+            return False
+        if not self.model_var.get().strip():
+            messagebox.showwarning("Missing Input", "Please enter the Ollama model name.")
+            return False
         if not self.jd_var.get():
             messagebox.showwarning("Missing Input", "Please select a Job Description file.")
             return False
@@ -460,12 +784,6 @@ class ResumeAnalyzerApp(tk.Tk):
             messagebox.showwarning("Missing Input",
                                    "Please add at least one resume file.")
             return False
-        if not self.model_var.get().strip():
-            messagebox.showwarning("Missing Input", "Please enter an LLM model name.")
-            return False
-        if not self.apikey_var.get().strip():
-            messagebox.showwarning("Missing Input", "Please enter your API key.")
-            return False
         return True
 
     def _start_analysis(self):
@@ -475,30 +793,39 @@ class ResumeAnalyzerApp(tk.Tk):
         self.results.clear()
         for iid in self.tree.get_children():
             self.tree.delete(iid)
+        self._summary_lbl.config(text="Analysis in progress…")
         threading.Thread(target=self._run_analysis, daemon=True).start()
 
     def _run_analysis(self):
         try:
             jd_text = extract_text(self.jd_var.get())
+            host    = self.host_var.get().strip()
+            port    = self.port_var.get().strip()
             model   = self.model_var.get().strip()
-            api_key = self.apikey_var.get().strip()
             total   = len(self.resume_files)
 
             for i, path in enumerate(self.resume_files):
                 fname = os.path.basename(path)
-                self._update_progress(i, total, f"Analysing {fname}…")
+                self._update_progress(i, total, f"Analysing  {fname}  …")
                 try:
-                    result = analyse_resume(path, jd_text, model, api_key)
+                    result = analyse_resume(path, jd_text, host, port, model)
                     result["_file"] = fname
                     self.results.append(result)
                     self._append_row(len(self.results), result)
                 except json.JSONDecodeError as exc:
-                    self._err(fname, f"LLM returned invalid JSON.\n\nDetails: {exc}")
+                    self._err(fname, f"Model returned invalid JSON.\n\nDetails: {exc}")
                 except Exception as exc:
                     self._err(fname, str(exc))
 
             self._update_progress(total, total,
                                   f"Complete — {total} resume(s) analysed.")
+            sel  = sum(1 for r in self.results
+                       if str(r.get("decision", "")).strip().lower() == "select")
+            rej  = len(self.results) - sel
+            self.after(0, lambda: self._summary_lbl.config(
+                text=f"{len(self.results)} analysed  ·  "
+                     f"{sel} selected  ·  {rej} rejected"
+            ))
         finally:
             self.after(0, lambda: self._analyse_btn.config(state="normal"))
 
@@ -510,8 +837,8 @@ class ResumeAnalyzerApp(tk.Tk):
         self.after(0, _do)
 
     def _append_row(self, serial: int, r: dict):
-        highlights = " | ".join(r.get("highlights", []))
-        lowlights  = " | ".join(r.get("lowlights",  []))
+        highlights = "  •  ".join(r.get("highlights", []))
+        lowlights  = "  •  ".join(r.get("lowlights",  []))
         score      = r.get("score", 0)
         decision   = r.get("decision", "Reject")
         tag        = "select" if str(decision).strip().lower() == "select" else "reject"
@@ -523,8 +850,8 @@ class ResumeAnalyzerApp(tk.Tk):
             fmt_exp(r.get("relevant_experience")),
             highlights,
             lowlights,
-            score,
-            decision,
+            f"{score} / 10",
+            "✓ " + decision if tag == "select" else "✕ " + decision,
         )
         self.after(0, lambda v=values, t=tag: self.tree.insert("", "end", values=v, tags=(t,)))
 
@@ -546,47 +873,87 @@ class ResumeAnalyzerApp(tk.Tk):
 
         win = tk.Toplevel(self)
         win.title(f"Detail — {r.get('name', 'Unknown')}")
-        win.geometry("660x560")
+        win.geometry("720x620")
         win.configure(bg=BG)
         win.grab_set()
         win.resizable(True, True)
 
-        hdr = tk.Frame(win, bg=ACCENT, height=46)
+        # Header
+        hdr = tk.Frame(win, bg=PRIMARY, height=66)
         hdr.pack(fill="x")
         hdr.pack_propagate(False)
-        tk.Label(hdr, text=f"  {r.get('name', 'Unknown')}", font=FONT_BOLD,
-                 bg=ACCENT, fg="white").pack(side="left", pady=10)
 
-        content = tk.Frame(win, bg=BG)
-        content.pack(fill="both", expand=True, padx=16, pady=12)
-
-        def section(title: str, text: str):
-            tk.Label(content, text=title, font=FONT_BOLD,
-                     bg=BG, fg=ACCENT).pack(anchor="w", pady=(10, 2))
-            lbl = tk.Label(content, text=text, font=FONT_BODY, bg=CARD,
-                           wraplength=600, justify="left", anchor="nw",
-                           relief="flat", padx=10, pady=6)
-            lbl.pack(fill="x")
-
-        section("File", r.get("_file", ""))
-        section("Total Experience",    fmt_exp(r.get("total_experience")))
-        section("Relevant Experience", fmt_exp(r.get("relevant_experience")))
-        section("Highlights",
-                "\n".join(f"• {h}" for h in r.get("highlights", ["—"])))
-        section("Lowlights",
-                "\n".join(f"• {l}" for l in r.get("lowlights",  ["—"])))
+        hdr_inner = tk.Frame(hdr, bg=PRIMARY)
+        hdr_inner.pack(side="left", padx=24, pady=12)
+        tk.Label(hdr_inner, text=r.get("name", "Unknown"),
+                 font=(FONT_FAMILY, 15, "bold"),
+                 bg=PRIMARY, fg="white").pack(anchor="w")
+        tk.Label(hdr_inner, text=r.get("_file", ""),
+                 font=FONT_SMALL, bg=PRIMARY, fg=TEXT_SUBTLE).pack(anchor="w")
 
         score    = r.get("score", 0)
         decision = r.get("decision", "Reject")
-        fg_dec   = "#1B5E20" if str(decision).strip().lower() == "select" else "#B71C1C"
-        row_bot  = tk.Frame(content, bg=BG)
-        row_bot.pack(fill="x", pady=(14, 0))
-        tk.Label(row_bot, text=f"Score: {score} / 10",
-                 font=("Segoe UI", 13, "bold"), bg=BG).pack(side="left", padx=(0, 24))
-        tk.Label(row_bot, text=f"Decision: {decision}",
-                 font=("Segoe UI", 13, "bold"), bg=BG, fg=fg_dec).pack(side="left")
+        is_sel   = str(decision).strip().lower() == "select"
 
-        self._flat_btn(win, "Close", win.destroy).pack(pady=12)
+        badge = tk.Frame(hdr, bg=PRIMARY)
+        badge.pack(side="right", padx=24, pady=14)
+        tk.Label(
+            badge,
+            text=("✓ " if is_sel else "✕ ") + decision,
+            font=FONT_BOLD,
+            bg=SUCCESS_BG if is_sel else DANGER_BG,
+            fg=SUCCESS if is_sel else DANGER,
+            padx=14, pady=6,
+        ).pack(side="right")
+
+        # Body
+        body = tk.Frame(win, bg=BG)
+        body.pack(fill="both", expand=True, padx=20, pady=16)
+
+        # Stat row
+        stats = tk.Frame(body, bg=BG)
+        stats.pack(fill="x", pady=(0, 14))
+
+        def stat(parent, label, value, fg=TEXT):
+            box = tk.Frame(parent, bg=CARD,
+                           highlightbackground=BORDER, highlightthickness=1)
+            box.pack(side="left", fill="x", expand=True, padx=(0, 10))
+            tk.Label(box, text=label, font=FONT_LABEL,
+                     bg=CARD, fg=TEXT_MUTED).pack(anchor="w", padx=14, pady=(10, 0))
+            tk.Label(box, text=value, font=(FONT_FAMILY, 14, "bold"),
+                     bg=CARD, fg=fg).pack(anchor="w", padx=14, pady=(0, 10))
+
+        stat(stats, "TOTAL EXPERIENCE",    fmt_exp(r.get("total_experience")))
+        stat(stats, "RELEVANT EXPERIENCE", fmt_exp(r.get("relevant_experience")))
+        stat(stats, "MATCH SCORE", f"{score} / 10",
+             fg=SUCCESS if is_sel else DANGER)
+
+        def section(title: str, items, color):
+            wrap = tk.Frame(body, bg=CARD,
+                            highlightbackground=BORDER, highlightthickness=1)
+            wrap.pack(fill="x", pady=(0, 10))
+            head = tk.Frame(wrap, bg=CARD)
+            head.pack(fill="x", padx=14, pady=(10, 4))
+            tk.Label(head, text=title, font=FONT_BOLD,
+                     bg=CARD, fg=color).pack(anchor="w")
+            for it in (items or ["—"]):
+                row = tk.Frame(wrap, bg=CARD)
+                row.pack(fill="x", padx=14, pady=2)
+                tk.Label(row, text="•", font=FONT_BOLD,
+                         bg=CARD, fg=color).pack(side="left", padx=(0, 6))
+                tk.Label(row, text=it, font=FONT_BODY, bg=CARD, fg=TEXT,
+                         wraplength=620, justify="left",
+                         anchor="w").pack(side="left", fill="x", expand=True)
+            tk.Frame(wrap, bg=CARD, height=8).pack()
+
+        section("Strengths",  r.get("highlights"), SUCCESS)
+        section("Concerns",   r.get("lowlights"),  DANGER)
+
+        footer = tk.Frame(win, bg=BG)
+        footer.pack(fill="x", padx=20, pady=(0, 16))
+        HoverButton(footer, "Close", win.destroy,
+                    bg=NEUTRAL_BTN, fg=TEXT, hover=NEUTRAL_HOVER,
+                    font=FONT_BOLD, padx=20, pady=8).pack(side="right")
 
     # ── Export ────────────────────────────────────────────────────────────────
 
@@ -642,10 +1009,9 @@ class ResumeAnalyzerApp(tk.Tk):
         ws = wb.active
         ws.title = "Resume Analysis"
 
-        # Header style
-        h_fill   = PatternFill("solid", fgColor="1565C0")
+        h_fill   = PatternFill("solid", fgColor="0F172A")
         h_font   = Font(bold=True, color="FFFFFF", name="Calibri", size=11)
-        thin     = Side(style="thin", color="C5CAE9")
+        thin     = Side(style="thin", color="E2E8F0")
         border   = Border(left=thin, right=thin, top=thin, bottom=thin)
         c_align  = Alignment(horizontal="center", vertical="top", wrap_text=True)
         l_align  = Alignment(horizontal="left",   vertical="top", wrap_text=True)
@@ -659,9 +1025,9 @@ class ResumeAnalyzerApp(tk.Tk):
             cell.alignment = c_align
             cell.border    = border
 
-        sel_fill = PatternFill("solid", fgColor="C8E6C9")
-        rej_fill = PatternFill("solid", fgColor="FFCDD2")
-        alt_fill = PatternFill("solid", fgColor="EEF2FF")
+        sel_fill = PatternFill("solid", fgColor="D1FAE5")
+        rej_fill = PatternFill("solid", fgColor="FEE2E2")
+        alt_fill = PatternFill("solid", fgColor="F8FAFC")
 
         for ri, r in enumerate(self.results, 2):
             decision = str(r.get("decision", "Reject")).strip().lower()
@@ -688,11 +1054,9 @@ class ResumeAnalyzerApp(tk.Tk):
                 cell.border    = border
                 cell.alignment = c_align if ci in (1, 3, 4, 7, 8) else l_align
 
-        # Column widths
-        for col, width in zip("ABCDEFGH", [5, 24, 16, 16, 44, 34, 8, 12]):
+        for col, width in zip("ABCDEFGH", [5, 26, 18, 18, 46, 36, 9, 13]):
             ws.column_dimensions[col].width = width
 
-        # Freeze header row
         ws.freeze_panes = "A2"
 
         wb.save(path)
