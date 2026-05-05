@@ -1,0 +1,298 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ app_name }} | {{ org_name }}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand-cluster">
+        <div class="brand-mark" aria-hidden="true">RS</div>
+        <div>
+          <h1>{{ app_name }}</h1>
+          <div class="tenant-name">{{ org_name }}</div>
+        </div>
+      </div>
+      <div class="topbar-actions">
+        <div class="status-pill" id="connectionStatus">
+          <span class="status-dot"></span>
+          <span class="status-text">Ready</span>
+        </div>
+      </div>
+    </header>
+
+    <main class="page-grid">
+      <aside class="command-rail" aria-label="Screening context">
+        <div class="rail-panel">
+          <div class="rail-kicker">Talent intelligence</div>
+          <h2>Structured resume review for high-volume hiring decisions.</h2>
+          <div class="silicon-map" aria-hidden="true">
+            <svg viewBox="0 0 360 190" role="img">
+              <rect x="128" y="46" width="104" height="98" rx="10"></rect>
+              <path d="M74 28h74v36M74 162h74v-34M286 28h-74v36M286 162h-74v-34"></path>
+              <path d="M180 20v26M180 144v26M110 95H54M306 95h-56M128 76H88M272 76h-40M128 116H88M272 116h-40"></path>
+              <circle cx="74" cy="28" r="5"></circle>
+              <circle cx="74" cy="162" r="5"></circle>
+              <circle cx="286" cy="28" r="5"></circle>
+              <circle cx="286" cy="162" r="5"></circle>
+              <circle cx="54" cy="95" r="5"></circle>
+              <circle cx="306" cy="95" r="5"></circle>
+            </svg>
+          </div>
+          <div class="process-list">
+            <div class="process-item">
+              <span>01</span>
+              <b>Connect</b>
+              <p>Use the approved model endpoint for private analysis.</p>
+            </div>
+            <div class="process-item">
+              <span>02</span>
+              <b>Screen</b>
+              <p>Compare resumes against one role specification.</p>
+            </div>
+            <div class="process-item">
+              <span>03</span>
+              <b>Review</b>
+              <p>Share clear scorecards with HR and leadership teams.</p>
+            </div>
+          </div>
+        </div>
+      </aside>
+
+      <section class="workspace">
+        {% if message %}
+          <div class="message {{ message_type }}">{{ message }}</div>
+        {% endif %}
+
+        <form id="screeningForm" action="{{ url_for('index') }}" method="post" enctype="multipart/form-data" class="screening-form">
+          <section class="panel">
+            <div class="panel-head">
+              <div>
+                <p class="eyebrow">Model endpoint</p>
+                <h2>Connection</h2>
+              </div>
+              <div class="mini-note">Private network inference</div>
+            </div>
+            <div class="panel-body connection-grid">
+              <label class="field">Host / IP
+                <input name="ollama_host" id="ollamaHost" type="text" value="{{ form.ollama_host }}" required>
+              </label>
+              <label class="field field-port">Port
+                <input name="ollama_port" id="ollamaPort" type="number" min="1" max="65535" value="{{ form.ollama_port }}" required>
+              </label>
+              <label class="field">Model
+                <input name="model" id="modelName" type="text" value="{{ form.model }}" list="modelOptions" required>
+                <datalist id="modelOptions">
+                  {% for model in known_models %}
+                    <option value="{{ model }}">
+                  {% endfor %}
+                </datalist>
+              </label>
+              <div class="field-actions">
+                <button class="button secondary" type="button" id="refreshModels">Refresh</button>
+                <button class="button ghost" type="button" id="testConnection">Test</button>
+              </div>
+            </div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-head">
+              <div>
+                <p class="eyebrow">Document intake</p>
+                <h2>Role and Candidate Files</h2>
+              </div>
+              <div class="mini-note">PDF, DOCX, PPTX, TXT</div>
+            </div>
+            <div class="panel-body upload-grid">
+              <label class="file-drop">
+                <span class="drop-title">Job Description</span>
+                <span class="drop-copy" id="jdFileLabel">Select the role document</span>
+                <input name="jd_file" type="file" accept=".pdf,.doc,.docx,.ppt,.pptx,.txt" required data-file-label="jdFileLabel">
+              </label>
+              <label class="file-drop">
+                <span class="drop-title">Resumes</span>
+                <span class="drop-copy" id="resumeFileLabel">Select candidate documents</span>
+                <input name="resumes" type="file" accept=".pdf,.doc,.docx,.ppt,.pptx,.txt" multiple required data-file-label="resumeFileLabel">
+              </label>
+            </div>
+          </section>
+
+          <section class="run-strip">
+            <div>
+              <b>{{ insights.total }} candidate{{ '' if insights.total == 1 else 's' }} in latest review</b>
+              <span>{{ insights.shortlist_rate }}% shortlist rate</span>
+            </div>
+            <div class="button-row">
+              {% if job_id and results %}
+                <a class="button secondary" href="{{ url_for('download_csv', job_id=job_id) }}">CSV</a>
+                <a class="button secondary" href="{{ url_for('download_excel', job_id=job_id) }}">Excel</a>
+              {% endif %}
+              <button class="button primary" type="submit" id="submitButton">Run Analysis</button>
+            </div>
+          </section>
+        </form>
+
+        <section class="insight-grid" aria-label="Screening metrics">
+          <div class="metric-card">
+            <span>Candidates</span>
+            <strong>{{ insights.total }}</strong>
+            <small>Analysed documents</small>
+          </div>
+          <div class="metric-card accent">
+            <span>Shortlisted</span>
+            <strong>{{ insights.selected }}</strong>
+            <small>{{ insights.shortlist_rate }}% selection rate</small>
+          </div>
+          <div class="metric-card">
+            <span>Average Score</span>
+            <strong>{{ insights.average_score }}</strong>
+            <small>Out of 10</small>
+          </div>
+          <div class="metric-card attention">
+            <span>Exceptions</span>
+            <strong>{{ insights.errors }}</strong>
+            <small>Files needing review</small>
+          </div>
+        </section>
+
+        {% if insights.top_candidates %}
+          <section class="leader-panel">
+            <div class="panel-head compact">
+              <div>
+                <p class="eyebrow">Leadership snapshot</p>
+                <h2>Top Candidates</h2>
+              </div>
+            </div>
+            <div class="leader-list">
+              {% for candidate in insights.top_candidates %}
+                {% set candidate_name = candidate.name or 'Unknown' %}
+                <div class="leader-item">
+                  <div class="avatar">{{ candidate_name[:1]|upper }}</div>
+                  <div>
+                    <b>{{ candidate_name }}</b>
+                    <span>{{ candidate.current_organization or candidate._file }}</span>
+                  </div>
+                  <strong>{{ candidate.score }}/10</strong>
+                </div>
+              {% endfor %}
+            </div>
+          </section>
+        {% endif %}
+
+        {% if errors %}
+          <section class="panel">
+            <div class="panel-head compact">
+              <div>
+                <p class="eyebrow">Review needed</p>
+                <h2>Exceptions</h2>
+              </div>
+            </div>
+            <div class="panel-body error-list">
+              {% for item in errors %}
+                <div class="message error"><b>{{ item.file }}</b><span>{{ item.error }}</span></div>
+              {% endfor %}
+            </div>
+          </section>
+        {% endif %}
+
+        <section class="panel results-panel">
+          <div class="panel-head results-head">
+            <div>
+              <p class="eyebrow">Decision matrix</p>
+              <h2>Analysis Results</h2>
+            </div>
+            {% if job_id and results %}
+              <div class="button-row">
+                <a class="button secondary" href="{{ url_for('download_csv', job_id=job_id) }}">Export CSV</a>
+                <a class="button primary" href="{{ url_for('download_excel', job_id=job_id) }}">Export Excel</a>
+              </div>
+            {% endif %}
+          </div>
+          {% if results %}
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Candidate</th>
+                    <th>Experience</th>
+                    <th>Education</th>
+                    <th>Organizations</th>
+                    <th>Strengths</th>
+                    <th>Concerns</th>
+                    <th>Score</th>
+                    <th>Decision</th>
+                    <th>Detail</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {% for row in results %}
+                    {% set candidate_name = row.name or 'Unknown' %}
+                    {% set is_select = row.decision|lower == 'select' %}
+                    <tr class="{{ 'select' if is_select else 'reject' }}">
+                      <td>
+                        <div class="candidate-cell">
+                          <div class="avatar">{{ candidate_name[:1]|upper }}</div>
+                          <div>
+                            <b>{{ candidate_name }}</b>
+                            <span>{{ row._file }}</span>
+                          </div>
+                        </div>
+                      </td>
+                      <td>
+                        <b>{{ format_exp(row.relevant_experience) }}</b>
+                        <span class="cell-sub">Relevant</span>
+                        <span class="cell-sub">{{ format_exp(row.total_experience) }} total</span>
+                      </td>
+                      <td>{{ format_education(row.education) }}</td>
+                      <td>
+                        <b>{{ row.current_organization or '-' }}</b>
+                        <span class="cell-sub">{{ format_orgs(row.past_organizations, row.current_organization) }}</span>
+                      </td>
+                      <td><ul>{% for item in row.highlights or [] %}<li>{{ item }}</li>{% endfor %}</ul></td>
+                      <td><ul>{% for item in row.lowlights or [] %}<li>{{ item }}</li>{% endfor %}</ul></td>
+                      <td>
+                        <div class="score-stack">
+                          <strong>{{ row.score }}</strong>
+                          <span class="score-track" style="--score: {{ row.score|int * 10 }}%;"><i></i></span>
+                        </div>
+                      </td>
+                      <td><span class="decision-pill {{ 'good' if is_select else 'bad' }}">{{ row.decision }}</span></td>
+                      <td>
+                        <details>
+                          <summary>View</summary>
+                          <div class="detail-body">
+                            <div><b>Education</b><span>{{ format_education(row.education) }}</span></div>
+                            <div><b>Current Org.</b><span>{{ row.current_organization or '-' }}</span></div>
+                            <div><b>Past Orgs.</b><span>{{ format_orgs(row.past_organizations, row.current_organization) }}</span></div>
+                            <div><b>Total Exp.</b><span>{{ format_exp(row.total_experience) }}</span></div>
+                          </div>
+                        </details>
+                      </td>
+                    </tr>
+                  {% endfor %}
+                </tbody>
+              </table>
+            </div>
+          {% else %}
+            <div class="empty-state">
+              <div class="empty-mark" aria-hidden="true"></div>
+              <b>No analysis run yet</b>
+              <span>Upload the role and candidate files to generate the decision matrix.</span>
+            </div>
+          {% endif %}
+        </section>
+      </section>
+    </main>
+
+    <footer class="app-footer">
+      <span>{{ app_name }}</span>
+      <span>Service endpoint: /api/analyze</span>
+    </footer>
+  </div>
+
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>

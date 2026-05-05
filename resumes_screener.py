@@ -1,71 +1,36 @@
 #!/usr/bin/env python3
-"""Resume Analyzer — On-Prem AI HR Screening Tool (Ollama-powered)."""
+"""Resumes Screener web service."""
 
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
-import threading
-import os
+from __future__ import annotations
+
+import csv
+import io
 import json
+import os
 import re
-import urllib.request
+import tempfile
+import uuid
 import urllib.error
+import urllib.request
 from pathlib import Path
+from typing import Any
 
-# ─── Text extraction ──────────────────────────────────────────────────────────
-
-def extract_pdf(path: str) -> str:
-    try:
-        import pdfplumber
-        with pdfplumber.open(path) as pdf:
-            return "\n".join(p.extract_text() or "" for p in pdf.pages)
-    except Exception as exc:
-        return f"[PDF read error: {exc}]"
+from flask import Flask, Response, abort, jsonify, render_template, request, send_file, url_for
+from werkzeug.datastructures import FileStorage
+from werkzeug.utils import secure_filename
 
 
-def extract_docx(path: str) -> str:
-    try:
-        from docx import Document
-        doc = Document(path)
-        return "\n".join(p.text for p in doc.paragraphs)
-    except Exception as exc:
-        return f"[DOCX read error: {exc}]"
+APP_NAME = "Resumes Screener"
+ORG_NAME = os.environ.get("RESUMES_SCREENER_ORG_NAME", "Samsung Semiconductor India Research")
+BASE_DIR = Path(__file__).resolve().parent
+UPLOAD_ROOT = Path(os.environ.get("RESUMES_SCREENER_UPLOAD_DIR", BASE_DIR / "uploads"))
+EXPORT_ROOT = Path(os.environ.get("RESUMES_SCREENER_EXPORT_DIR", BASE_DIR / "exports"))
+SUPPORTED_EXTENSIONS = {".pdf", ".doc", ".docx", ".ppt", ".pptx", ".txt"}
+OLLAMA_TIMEOUT = int(os.environ.get("RESUMES_SCREENER_OLLAMA_TIMEOUT", "600"))
+DEFAULT_OLLAMA_HOST = os.environ.get("RESUMES_SCREENER_OLLAMA_HOST", "localhost")
+DEFAULT_OLLAMA_PORT = os.environ.get("RESUMES_SCREENER_OLLAMA_PORT", "11434")
+DEFAULT_MODEL = os.environ.get("RESUMES_SCREENER_MODEL", "llama3.1")
 
-
-def extract_pptx(path: str) -> str:
-    try:
-        from pptx import Presentation
-        prs = Presentation(path)
-        parts = []
-        for slide in prs.slides:
-            for shape in slide.shapes:
-                if hasattr(shape, "text") and shape.text:
-                    parts.append(shape.text)
-        return "\n".join(parts)
-    except Exception as exc:
-        return f"[PPTX read error: {exc}]"
-
-
-def extract_txt(path: str) -> str:
-    try:
-        return Path(path).read_text(encoding="utf-8", errors="replace")
-    except Exception as exc:
-        return f"[TXT read error: {exc}]"
-
-
-def extract_text(path: str) -> str:
-    ext = Path(path).suffix.lower()
-    if ext == ".pdf":
-        return extract_pdf(path)
-    if ext in {".doc", ".docx"}:
-        return extract_docx(path)
-    if ext in {".ppt", ".pptx"}:
-        return extract_pptx(path)
-    if ext == ".txt":
-        return extract_txt(path)
-    return f"[Unsupported file type: {ext}]"
-
-
-# ─── Ollama interaction ───────────────────────────────────────────────────────
 
 ANALYSIS_PROMPT = """\
 You are a seasoned HR analyst with more than 20 years of recruitment experience
@@ -73,7 +38,7 @@ across the industry. You have screened thousands of resumes, interviewed candida
 at every level, and have a sharp eye for role fit, career trajectory, and red flags.
 Apply that depth of judgement when evaluating this resume against the job description.
 
-Respond with ONLY a valid JSON object — no markdown fences, no explanation, just raw JSON.
+Respond with ONLY a valid JSON object. No markdown fences, no explanation, just raw JSON.
 
 JOB DESCRIPTION:
 {jd}
@@ -105,15 +70,701 @@ Rules:
 - current_organization: the single employer the candidate works at right now.
   Use an empty string if the candidate is not currently employed.
 - past_organizations: every prior employer in reverse chronological order (most recent first).
-  Deduplicate strictly — each company name must appear only once even if the candidate
+  Deduplicate strictly. Each company name must appear only once even if the candidate
   worked there in multiple stints. Do NOT include the current organization in this list.
-- score is 1–10 based on how well the resume matches the job description
+- score is 1-10 based on how well the resume matches the job description
 - decision MUST be "Select" when score > 6, otherwise "Reject"
 - Extract the candidate name directly from the resume text
 - Be specific in highlights and lowlights (3 highlights, 2 lowlights minimum)
 """
 
-OLLAMA_TIMEOUT = 600  # seconds — local LLMs can be slow on CPU
+
+INDEX_TEMPLATE = """
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ app_name }}</title>
+  <style>
+    :root {
+      --ink: #17211f;
+      --muted: #5f6f6a;
+      --subtle: #8b9994;
+      --bg: #f5f7f4;
+      --panel: #ffffff;
+      --line: #dbe3de;
+      --line-strong: #c6d3cd;
+      --brand: #0f766e;
+      --brand-deep: #115e59;
+      --brand-soft: #d9f3ef;
+      --warn-soft: #fff1d6;
+      --danger: #b42318;
+      --danger-soft: #fee4e2;
+      --ok: #047857;
+      --ok-soft: #dff7ea;
+      --shadow: 0 12px 30px rgba(30, 41, 36, .08);
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      color: var(--ink);
+      background: var(--bg);
+      font-family: "Segoe UI", Arial, sans-serif;
+      line-height: 1.45;
+    }
+
+    header {
+      height: 76px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 28px;
+      color: white;
+      background: #17211f;
+      border-bottom: 4px solid var(--brand);
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 24px;
+      line-height: 1.1;
+      letter-spacing: 0;
+    }
+
+    .status-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      min-height: 32px;
+      padding: 6px 12px;
+      border: 1px solid rgba(255,255,255,.18);
+      border-radius: 999px;
+      color: #d5ded9;
+      font-size: 13px;
+      white-space: nowrap;
+    }
+
+    .status-dot {
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      background: var(--subtle);
+    }
+
+    main {
+      width: min(1360px, 100%);
+      margin: 0 auto;
+      padding: 24px;
+    }
+
+    form {
+      display: grid;
+      gap: 16px;
+    }
+
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: var(--shadow);
+    }
+
+    .panel-head {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 16px 18px 10px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .panel-title {
+      margin: 0;
+      font-size: 16px;
+      line-height: 1.2;
+    }
+
+    .panel-note {
+      margin: 4px 0 0;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .panel-body {
+      padding: 16px 18px 18px;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: minmax(180px, 2fr) minmax(90px, .7fr) minmax(180px, 2fr) auto auto;
+      gap: 12px;
+      align-items: end;
+    }
+
+    label {
+      display: grid;
+      gap: 6px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0;
+      text-transform: uppercase;
+    }
+
+    input[type="text"],
+    input[type="number"],
+    input[type="file"],
+    textarea,
+    select {
+      width: 100%;
+      min-height: 42px;
+      border: 1px solid var(--line-strong);
+      border-radius: 6px;
+      padding: 9px 10px;
+      color: var(--ink);
+      background: white;
+      font: inherit;
+      outline: none;
+    }
+
+    textarea {
+      min-height: 160px;
+      resize: vertical;
+    }
+
+    input:focus,
+    textarea:focus,
+    select:focus {
+      border-color: var(--brand);
+      box-shadow: 0 0 0 3px rgba(15, 118, 110, .14);
+    }
+
+    .button-row {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 10px;
+    }
+
+    button,
+    .button {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 40px;
+      border: 1px solid transparent;
+      border-radius: 6px;
+      padding: 9px 14px;
+      color: white;
+      background: var(--brand);
+      font: inherit;
+      font-weight: 700;
+      text-decoration: none;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+
+    button:hover,
+    .button:hover {
+      background: var(--brand-deep);
+    }
+
+    .button.secondary,
+    button.secondary {
+      color: var(--ink);
+      background: #edf2ef;
+      border-color: var(--line);
+    }
+
+    .button.secondary:hover,
+    button.secondary:hover {
+      background: #e1e9e5;
+    }
+
+    .button.ghost,
+    button.ghost {
+      color: var(--brand-deep);
+      background: transparent;
+      border-color: var(--line-strong);
+    }
+
+    .button.ghost:hover,
+    button.ghost:hover {
+      background: var(--brand-soft);
+    }
+
+    .action-panel {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 16px 18px;
+    }
+
+    .summary {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    .metric {
+      display: inline-flex;
+      align-items: center;
+      min-height: 30px;
+      padding: 5px 10px;
+      border-radius: 999px;
+      background: #edf2ef;
+      color: var(--ink);
+      font-weight: 700;
+    }
+
+    .message {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 12px 14px;
+      background: white;
+      color: var(--muted);
+    }
+
+    .message.error {
+      color: var(--danger);
+      border-color: #f5b4ae;
+      background: var(--danger-soft);
+    }
+
+    .message.ok {
+      color: var(--ok);
+      border-color: #b7e8cb;
+      background: var(--ok-soft);
+    }
+
+    .table-wrap {
+      overflow: auto;
+      border-top: 1px solid var(--line);
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      min-width: 1120px;
+    }
+
+    th,
+    td {
+      padding: 12px 10px;
+      border-bottom: 1px solid var(--line);
+      vertical-align: top;
+      text-align: left;
+      font-size: 13px;
+    }
+
+    th {
+      position: sticky;
+      top: 0;
+      z-index: 1;
+      color: white;
+      background: #17211f;
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0;
+    }
+
+    tr.select td { background: var(--ok-soft); }
+    tr.reject td { background: var(--danger-soft); }
+    .mono { font-family: Consolas, "Liberation Mono", monospace; }
+    .muted { color: var(--muted); }
+    .score {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 46px;
+      height: 28px;
+      border-radius: 999px;
+      color: var(--ink);
+      background: var(--warn-soft);
+      font-weight: 800;
+    }
+
+    details {
+      margin: 0;
+    }
+
+    summary {
+      cursor: pointer;
+      color: var(--brand-deep);
+      font-weight: 700;
+    }
+
+    .detail-body {
+      display: grid;
+      gap: 8px;
+      margin-top: 10px;
+      color: var(--ink);
+    }
+
+    .kv {
+      display: grid;
+      grid-template-columns: 130px minmax(0, 1fr);
+      gap: 10px;
+    }
+
+    .kv b {
+      color: var(--muted);
+      font-size: 12px;
+      text-transform: uppercase;
+    }
+
+    ul {
+      margin: 0;
+      padding-left: 18px;
+    }
+
+    footer {
+      width: min(1360px, 100%);
+      margin: 0 auto;
+      padding: 0 24px 24px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    @media (max-width: 900px) {
+      header {
+        height: auto;
+        min-height: 76px;
+        align-items: flex-start;
+        flex-direction: column;
+        justify-content: center;
+        gap: 10px;
+        padding: 16px 20px;
+      }
+
+      main {
+        padding: 16px;
+      }
+
+      .grid {
+        grid-template-columns: 1fr;
+      }
+
+      .action-panel {
+        align-items: stretch;
+      }
+
+      .button-row,
+      .action-panel > .button-row {
+        width: 100%;
+      }
+
+      button,
+      .button {
+        width: 100%;
+      }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>{{ app_name }}</h1>
+    <div class="status-pill" id="connectionStatus"><span class="status-dot"></span><span>Ready</span></div>
+  </header>
+
+  <main>
+    {% if message %}
+      <div class="message {{ message_type }}">{{ message }}</div>
+    {% endif %}
+
+    <form id="screeningForm" action="{{ url_for('index') }}" method="post" enctype="multipart/form-data">
+      <section class="panel">
+        <div class="panel-head">
+          <div>
+            <h2 class="panel-title">Model Connection</h2>
+            <p class="panel-note">Configure the model endpoint used for screening.</p>
+          </div>
+        </div>
+        <div class="panel-body">
+          <div class="grid">
+            <label>Host / IP
+              <input name="ollama_host" id="ollamaHost" type="text" value="{{ form.ollama_host }}" required>
+            </label>
+            <label>Port
+              <input name="ollama_port" id="ollamaPort" type="number" min="1" max="65535" value="{{ form.ollama_port }}" required>
+            </label>
+            <label>Model
+              <input name="model" id="modelName" type="text" value="{{ form.model }}" list="modelOptions" required>
+              <datalist id="modelOptions">
+                {% for model in known_models %}
+                  <option value="{{ model }}">
+                {% endfor %}
+              </datalist>
+            </label>
+            <button class="secondary" type="button" id="refreshModels">Refresh</button>
+            <button class="ghost" type="button" id="testConnection">Test</button>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <div>
+            <h2 class="panel-title">Job Description</h2>
+            <p class="panel-note">Upload a PDF, DOCX, PPTX, or TXT role document.</p>
+          </div>
+        </div>
+        <div class="panel-body">
+          <label>Role Document
+            <input name="jd_file" type="file" accept=".pdf,.doc,.docx,.ppt,.pptx,.txt" required>
+          </label>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <div>
+            <h2 class="panel-title">Resumes</h2>
+            <p class="panel-note">Upload one or more candidate documents.</p>
+          </div>
+        </div>
+        <div class="panel-body">
+          <label>Candidate Documents
+            <input name="resumes" type="file" accept=".pdf,.doc,.docx,.ppt,.pptx,.txt" multiple required>
+          </label>
+        </div>
+      </section>
+
+      <section class="panel action-panel">
+        <div class="summary">
+          {% if summary %}
+            <span class="metric">{{ summary.total }} analysed</span>
+            <span class="metric">{{ summary.selected }} selected</span>
+            <span class="metric">{{ summary.rejected }} rejected</span>
+            {% if errors %}<span class="metric">{{ errors|length }} error{{ '' if errors|length == 1 else 's' }}</span>{% endif %}
+          {% else %}
+            <span>Ready to analyse</span>
+          {% endif %}
+        </div>
+        <div class="button-row">
+          {% if job_id and results %}
+            <a class="button secondary" href="{{ url_for('download_csv', job_id=job_id) }}">CSV</a>
+            <a class="button secondary" href="{{ url_for('download_excel', job_id=job_id) }}">Excel</a>
+          {% endif %}
+          <button type="submit" id="submitButton">Run Analysis</button>
+        </div>
+      </section>
+    </form>
+
+    {% if errors %}
+      <section class="panel" style="margin-top: 16px;">
+        <div class="panel-head">
+          <div>
+            <h2 class="panel-title">Errors</h2>
+          </div>
+        </div>
+        <div class="panel-body">
+          {% for item in errors %}
+            <div class="message error" style="margin-bottom: 10px;"><b>{{ item.file }}</b>: {{ item.error }}</div>
+          {% endfor %}
+        </div>
+      </section>
+    {% endif %}
+
+    <section class="panel" style="margin-top: 16px;">
+      <div class="panel-head">
+        <div>
+          <h2 class="panel-title">Analysis Results</h2>
+          <p class="panel-note">Expand a row for candidate detail.</p>
+        </div>
+      </div>
+      {% if results %}
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>#</th>
+                <th>Name</th>
+                <th>Education</th>
+                <th>Current Org.</th>
+                <th>Past Orgs.</th>
+                <th>Total Exp.</th>
+                <th>Relevant Exp.</th>
+                <th>Highlights</th>
+                <th>Lowlights</th>
+                <th>Score</th>
+                <th>Decision</th>
+                <th>Detail</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for row in results %}
+                {% set is_select = row.decision|lower == 'select' %}
+                <tr class="{{ 'select' if is_select else 'reject' }}">
+                  <td class="mono">{{ loop.index }}</td>
+                  <td>{{ row.name or 'Unknown' }}<br><span class="muted">{{ row._file }}</span></td>
+                  <td>{{ format_education(row.education) }}</td>
+                  <td>{{ row.current_organization or '-' }}</td>
+                  <td>{{ format_orgs(row.past_organizations, row.current_organization) }}</td>
+                  <td>{{ format_exp(row.total_experience) }}</td>
+                  <td>{{ format_exp(row.relevant_experience) }}</td>
+                  <td><ul>{% for item in row.highlights or [] %}<li>{{ item }}</li>{% endfor %}</ul></td>
+                  <td><ul>{% for item in row.lowlights or [] %}<li>{{ item }}</li>{% endfor %}</ul></td>
+                  <td><span class="score">{{ row.score }}</span></td>
+                  <td><b>{{ row.decision }}</b></td>
+                  <td>
+                    <details>
+                      <summary>Open</summary>
+                      <div class="detail-body">
+                        <div class="kv"><b>File</b><span>{{ row._file }}</span></div>
+                        <div class="kv"><b>Education</b><span>{{ format_education(row.education) }}</span></div>
+                        <div class="kv"><b>Current</b><span>{{ row.current_organization or '-' }}</span></div>
+                        <div class="kv"><b>Past</b><span>{{ format_orgs(row.past_organizations, row.current_organization) }}</span></div>
+                      </div>
+                    </details>
+                  </td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% else %}
+        <div class="panel-body">
+          <div class="message">No analysis run yet.</div>
+        </div>
+      {% endif %}
+    </section>
+  </main>
+
+  <footer>
+    <span>Service endpoint: /api/analyze</span>
+  </footer>
+
+  <script>
+    const statusEl = document.getElementById("connectionStatus");
+    const statusDot = statusEl.querySelector(".status-dot");
+    const statusText = statusEl.querySelector("span:last-child");
+    const hostInput = document.getElementById("ollamaHost");
+    const portInput = document.getElementById("ollamaPort");
+    const modelInput = document.getElementById("modelName");
+    const modelOptions = document.getElementById("modelOptions");
+    const submitButton = document.getElementById("submitButton");
+    const form = document.getElementById("screeningForm");
+
+    function setStatus(text, state) {
+      statusText.textContent = text;
+      statusDot.style.background = state === "ok" ? "#22c55e" : state === "bad" ? "#ef4444" : "#8b9994";
+    }
+
+    function endpointParams() {
+      return new URLSearchParams({ host: hostInput.value, port: portInput.value });
+    }
+
+    document.getElementById("refreshModels").addEventListener("click", async () => {
+      setStatus("Refreshing", "idle");
+      try {
+        const response = await fetch(`/api/models?${endpointParams().toString()}`);
+        const payload = await response.json();
+        modelOptions.innerHTML = "";
+        for (const name of payload.models || []) {
+          const option = document.createElement("option");
+          option.value = name;
+          modelOptions.appendChild(option);
+        }
+        if (payload.models && payload.models.length && !payload.models.includes(modelInput.value)) {
+          modelInput.value = payload.models[0];
+        }
+        setStatus(payload.models.length ? `${payload.models.length} model(s)` : "No models", payload.models.length ? "ok" : "bad");
+      } catch (error) {
+        setStatus("Unreachable", "bad");
+      }
+    });
+
+    document.getElementById("testConnection").addEventListener("click", async () => {
+      setStatus("Testing", "idle");
+      try {
+        const response = await fetch("/api/test-connection", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            host: hostInput.value,
+            port: portInput.value,
+            model: modelInput.value
+          })
+        });
+        const payload = await response.json();
+        setStatus(payload.message || "Checked", payload.ok ? "ok" : "bad");
+      } catch (error) {
+        setStatus("Unreachable", "bad");
+      }
+    });
+
+    form.addEventListener("submit", () => {
+      submitButton.disabled = true;
+      submitButton.textContent = "Analysing";
+      setStatus("Analysing", "idle");
+    });
+  </script>
+</body>
+</html>
+"""
+
+
+def extract_pdf(path: str) -> str:
+    try:
+        import pdfplumber
+
+        with pdfplumber.open(path) as pdf:
+            return "\n".join(page.extract_text() or "" for page in pdf.pages)
+    except Exception as exc:  # pragma: no cover - depends on document parser internals
+        return f"[PDF read error: {exc}]"
+
+
+def extract_docx(path: str) -> str:
+    try:
+        from docx import Document
+
+        doc = Document(path)
+        return "\n".join(p.text for p in doc.paragraphs)
+    except Exception as exc:  # pragma: no cover - depends on document parser internals
+        return f"[DOCX read error: {exc}]"
+
+
+def extract_pptx(path: str) -> str:
+    try:
+        from pptx import Presentation
+
+        prs = Presentation(path)
+        parts: list[str] = []
+        for slide in prs.slides:
+            for shape in slide.shapes:
+                if hasattr(shape, "text") and shape.text:
+                    parts.append(shape.text)
+        return "\n".join(parts)
+    except Exception as exc:  # pragma: no cover - depends on document parser internals
+        return f"[PPTX read error: {exc}]"
+
+
+def extract_txt(path: str) -> str:
+    try:
+        return Path(path).read_text(encoding="utf-8", errors="replace")
+    except Exception as exc:  # pragma: no cover - depends on filesystem errors
+        return f"[TXT read error: {exc}]"
+
+
+def extract_text(path: str) -> str:
+    ext = Path(path).suffix.lower()
+    if ext == ".pdf":
+        return extract_pdf(path)
+    if ext in {".doc", ".docx"}:
+        return extract_docx(path)
+    if ext in {".ppt", ".pptx"}:
+        return extract_pptx(path)
+    if ext == ".txt":
+        return extract_txt(path)
+    return f"[Unsupported file type: {ext}]"
 
 
 def _strip_fences(text: str) -> str:
@@ -131,31 +782,31 @@ def _ollama_url(host: str, port: str, path: str) -> str:
 
 
 def ollama_generate(host: str, port: str, model: str, prompt: str) -> str:
-    """Call Ollama /api/generate and return the model's text response."""
     url = _ollama_url(host, port, "/api/generate")
-    payload = json.dumps({
-        "model": model,
-        "prompt": prompt,
-        "stream": False,
-        "format": "json",
-        "options": {"temperature": 0.2},
-    }).encode("utf-8")
+    payload = json.dumps(
+        {
+            "model": model,
+            "prompt": prompt,
+            "stream": False,
+            "format": "json",
+            "options": {"temperature": 0.2},
+        }
+    ).encode("utf-8")
     req = urllib.request.Request(
         url, data=payload, headers={"Content-Type": "application/json"}, method="POST"
     )
     try:
         with urllib.request.urlopen(req, timeout=OLLAMA_TIMEOUT) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"Ollama HTTP {e.code}: {body}") from e
-    except urllib.error.URLError as e:
-        raise RuntimeError(f"Cannot reach Ollama at {url} — {e.reason}") from e
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Model server HTTP {exc.code}: {body}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Cannot reach model server at {url}: {exc.reason}") from exc
     return data.get("response", "")
 
 
 def ollama_list_models(host: str, port: str) -> list[str]:
-    """Return locally available model names from Ollama, or [] on failure."""
     url = _ollama_url(host, port, "/api/tags")
     try:
         with urllib.request.urlopen(url, timeout=10) as resp:
@@ -165,73 +816,44 @@ def ollama_list_models(host: str, port: str) -> list[str]:
         return []
 
 
-def analyse_resume(path: str, jd_text: str, host: str, port: str, model: str) -> dict:
+def analyse_resume(path: str, jd_text: str, host: str, port: str, model: str) -> dict[str, Any]:
     resume_text = extract_text(path)
     prompt = ANALYSIS_PROMPT.format(jd=jd_text, resume=resume_text)
     raw = ollama_generate(host, port, model, prompt)
-    return json.loads(_strip_fences(raw))
+    parsed = json.loads(_strip_fences(raw))
+    if not isinstance(parsed, dict):
+        raise RuntimeError("Model returned JSON, but not a JSON object.")
+    return parsed
 
 
-# ─── Design tokens ────────────────────────────────────────────────────────────
-
-# Slate + Indigo professional palette
-PRIMARY       = "#0F172A"   # slate-900   (header background)
-PRIMARY_SOFT  = "#1E293B"   # slate-800
-ACCENT        = "#4F46E5"   # indigo-600  (primary action)
-ACCENT_HOVER  = "#4338CA"   # indigo-700
-ACCENT_DEEP   = "#3730A3"   # indigo-800
-ACCENT_LIGHT  = "#EEF2FF"   # indigo-50
-BG            = "#F1F5F9"   # slate-100
-CARD          = "#FFFFFF"
-BORDER        = "#E2E8F0"   # slate-200
-BORDER_DARK   = "#CBD5E1"   # slate-300
-TEXT          = "#0F172A"
-TEXT_MUTED    = "#475569"   # slate-600
-TEXT_SUBTLE   = "#94A3B8"   # slate-400
-SUCCESS       = "#047857"   # emerald-700
-SUCCESS_BG    = "#D1FAE5"   # emerald-100
-DANGER        = "#B91C1C"   # red-700
-DANGER_BG     = "#FEE2E2"   # red-100
-NEUTRAL_BTN   = "#F1F5F9"
-NEUTRAL_HOVER = "#E2E8F0"
-ROW_ALT       = "#F8FAFC"   # slate-50
-
-FONT_FAMILY  = "Segoe UI"
-FONT_TITLE   = (FONT_FAMILY, 17, "bold")
-FONT_SUB     = (FONT_FAMILY, 10)
-FONT_SECTION = (FONT_FAMILY, 11, "bold")
-FONT_BODY    = (FONT_FAMILY, 10)
-FONT_BOLD    = (FONT_FAMILY, 10, "bold")
-FONT_LABEL   = (FONT_FAMILY, 9, "bold")
-FONT_SMALL   = (FONT_FAMILY, 9)
-FONT_MICRO   = (FONT_FAMILY, 8)
-FONT_MONO    = ("Consolas", 10)
-
-
-# ─── Helpers ──────────────────────────────────────────────────────────────────
-
-def fmt_exp(exp: dict | None) -> str:
+def fmt_exp(exp: dict[str, Any] | None) -> str:
     if not exp:
         return "N/A"
-    y, m = int(exp.get("years", 0)), int(exp.get("months", 0))
-    return f"{y}y {m}m"
+    try:
+        years = int(exp.get("years", 0))
+        months = int(exp.get("months", 0))
+    except (TypeError, ValueError):
+        return "N/A"
+    return f"{years}y {months}m"
 
 
-def fmt_education(edu: list | None) -> str:
-    """Render education as 'Degree, College, Year' entries, deduplicated."""
+def fmt_education(edu: list[Any] | None) -> str:
     if not edu:
-        return "—"
-    seen, out = set(), []
-    for e in edu:
-        if not isinstance(e, dict):
+        return "-"
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in edu:
+        if not isinstance(item, dict):
             continue
-        deg  = str(e.get("degree", "") or "").strip()
-        coll = str(e.get("college", "") or "").strip()
-        yr   = e.get("year")
-        yr_s = str(int(yr)) if isinstance(yr, (int, float)) and yr else (
-            str(yr).strip() if yr else ""
-        )
-        parts = [p for p in (deg, coll, yr_s) if p]
+        degree = str(item.get("degree", "") or "").strip()
+        college = str(item.get("college", "") or "").strip()
+        year = item.get("year")
+        year_text = ""
+        if isinstance(year, (int, float)) and year:
+            year_text = str(int(year))
+        elif year:
+            year_text = str(year).strip()
+        parts = [part for part in (degree, college, year_text) if part]
         if not parts:
             continue
         line = ", ".join(parts)
@@ -240,1014 +862,497 @@ def fmt_education(edu: list | None) -> str:
             continue
         seen.add(key)
         out.append(line)
-    return "  ·  ".join(out) if out else "—"
+    return " | ".join(out) if out else "-"
 
 
-def fmt_orgs(orgs: list | None, exclude: str = "") -> str:
-    """Comma-separated list of organizations, deduplicated, excluding `exclude`."""
+def fmt_orgs(orgs: list[Any] | None, exclude: str = "") -> str:
     if not orgs:
-        return "—"
-    excl = (exclude or "").strip().lower()
-    seen, out = set(), []
-    for o in orgs:
-        s = str(o or "").strip()
-        if not s:
-            continue
-        key = s.lower()
-        if key in seen or key == excl:
+        return "-"
+    excluded = (exclude or "").strip().lower()
+    seen: set[str] = set()
+    out: list[str] = []
+    for org in orgs:
+        text = str(org or "").strip()
+        key = text.lower()
+        if not text or key in seen or key == excluded:
             continue
         seen.add(key)
-        out.append(s)
-    return ", ".join(out) if out else "—"
+        out.append(text)
+    return ", ".join(out) if out else "-"
 
 
-class ToolTip:
-    def __init__(self, widget, text: str):
-        self.tip = None
-        widget.bind("<Enter>", lambda _: self._show(widget, text))
-        widget.bind("<Leave>", lambda _: self._hide())
+def _normalise_result(result: dict[str, Any], file_name: str) -> dict[str, Any]:
+    score = result.get("score", 0)
+    try:
+        score = int(score)
+    except (TypeError, ValueError):
+        score = 0
+    score = max(0, min(10, score))
+    decision = str(result.get("decision") or ("Select" if score > 6 else "Reject")).strip()
+    if decision.lower() not in {"select", "reject"}:
+        decision = "Select" if score > 6 else "Reject"
+    normalised = dict(result)
+    normalised["_file"] = file_name
+    normalised["name"] = str(normalised.get("name") or "Unknown").strip() or "Unknown"
+    normalised["education"] = normalised.get("education") if isinstance(normalised.get("education"), list) else []
+    normalised["current_organization"] = str(normalised.get("current_organization") or "").strip()
+    normalised["past_organizations"] = (
+        normalised.get("past_organizations")
+        if isinstance(normalised.get("past_organizations"), list)
+        else []
+    )
+    normalised["total_experience"] = (
+        normalised.get("total_experience")
+        if isinstance(normalised.get("total_experience"), dict)
+        else {"years": 0, "months": 0}
+    )
+    normalised["relevant_experience"] = (
+        normalised.get("relevant_experience")
+        if isinstance(normalised.get("relevant_experience"), dict)
+        else {"years": 0, "months": 0}
+    )
+    normalised["highlights"] = (
+        normalised.get("highlights") if isinstance(normalised.get("highlights"), list) else []
+    )
+    normalised["lowlights"] = (
+        normalised.get("lowlights") if isinstance(normalised.get("lowlights"), list) else []
+    )
+    normalised["score"] = score
+    normalised["decision"] = "Select" if decision.lower() == "select" else "Reject"
+    return normalised
 
-    def _show(self, widget, text):
-        x = widget.winfo_rootx() + 20
-        y = widget.winfo_rooty() + widget.winfo_height() + 6
-        self.tip = tk.Toplevel(widget)
-        self.tip.wm_overrideredirect(True)
-        self.tip.wm_geometry(f"+{x}+{y}")
-        tk.Label(
-            self.tip, text=text, bg=PRIMARY_SOFT, fg="white",
-            relief="flat", borderwidth=0, font=FONT_SMALL,
-            padx=8, pady=5,
-        ).pack()
 
-    def _hide(self):
-        if self.tip:
-            self.tip.destroy()
-            self.tip = None
+def _summary(results: list[dict[str, Any]]) -> dict[str, int]:
+    selected = sum(1 for row in results if str(row.get("decision", "")).lower() == "select")
+    return {
+        "total": len(results),
+        "selected": selected,
+        "rejected": len(results) - selected,
+    }
 
 
-class HoverButton(tk.Button):
-    """Flat button with controlled hover/press colors."""
-    def __init__(self, parent, text, command, *,
-                 bg=ACCENT, fg="white", hover=ACCENT_HOVER,
-                 font=FONT_BODY, padx=14, pady=7, **kw):
-        super().__init__(
-            parent, text=text, command=command, font=font,
-            bg=bg, fg=fg, activebackground=hover, activeforeground=fg,
-            relief="flat", borderwidth=0, padx=padx, pady=pady,
-            cursor="hand2", highlightthickness=0, **kw,
+def _view_insights(
+    results: list[dict[str, Any]],
+    errors: list[dict[str, str]],
+) -> dict[str, Any]:
+    scores = []
+    for row in results:
+        try:
+            scores.append(int(row.get("score", 0)))
+        except (TypeError, ValueError):
+            scores.append(0)
+    selected = sum(1 for row in results if str(row.get("decision", "")).lower() == "select")
+    total = len(results)
+    return {
+        "total": total,
+        "selected": selected,
+        "rejected": total - selected,
+        "errors": len(errors),
+        "average_score": round(sum(scores) / total, 1) if total else 0,
+        "top_score": max(scores) if scores else 0,
+        "shortlist_rate": round((selected / total) * 100) if total else 0,
+        "top_candidates": sorted(
+            results,
+            key=lambda row: int(row.get("score") or 0),
+            reverse=True,
+        )[:3],
+    }
+
+
+def _validate_port(port: str) -> str:
+    text = str(port or "").strip()
+    if not text.isdigit() or not 1 <= int(text) <= 65535:
+        raise ValueError("Port must be a number from 1 to 65535.")
+    return text
+
+
+def _validate_file(file: FileStorage | None, label: str) -> None:
+    if file is None or not file.filename:
+        raise ValueError(f"{label} is required.")
+    ext = Path(file.filename).suffix.lower()
+    if ext not in SUPPORTED_EXTENSIONS:
+        raise ValueError(f"{label} has an unsupported file type: {ext or 'none'}.")
+
+
+def _save_upload(file: FileStorage, target_dir: Path) -> Path:
+    _validate_file(file, "Upload")
+    safe_name = secure_filename(file.filename or f"upload-{uuid.uuid4().hex}")
+    dest = target_dir / f"{uuid.uuid4().hex}-{safe_name}"
+    file.save(dest)
+    return dest
+
+
+def _screen_documents(
+    jd_path: Path,
+    resume_paths: list[Path],
+    host: str,
+    port: str,
+    model: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+    jd_text = extract_text(str(jd_path))
+    results: list[dict[str, Any]] = []
+    errors: list[dict[str, str]] = []
+
+    for path in resume_paths:
+        try:
+            result = analyse_resume(str(path), jd_text, host, port, model)
+            results.append(_normalise_result(result, path.name.split("-", 1)[-1]))
+        except json.JSONDecodeError as exc:
+            errors.append({"file": path.name.split("-", 1)[-1], "error": f"Model returned invalid JSON: {exc}"})
+        except Exception as exc:
+            errors.append({"file": path.name.split("-", 1)[-1], "error": str(exc)})
+    return results, errors
+
+
+def _save_job(
+    results: list[dict[str, Any]],
+    errors: list[dict[str, str]],
+    config: dict[str, str],
+) -> str:
+    EXPORT_ROOT.mkdir(parents=True, exist_ok=True)
+    job_id = uuid.uuid4().hex
+    payload = {
+        "job_id": job_id,
+        "summary": _summary(results),
+        "results": results,
+        "errors": errors,
+        "config": config,
+    }
+    (EXPORT_ROOT / f"{job_id}.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return job_id
+
+
+def _load_job(job_id: str) -> dict[str, Any]:
+    if not re.fullmatch(r"[a-f0-9]{32}", job_id):
+        abort(404)
+    path = EXPORT_ROOT / f"{job_id}.json"
+    if not path.exists():
+        abort(404)
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _csv_bytes(results: list[dict[str, Any]]) -> bytes:
+    output = io.StringIO(newline="")
+    writer = csv.writer(output)
+    writer.writerow(
+        [
+            "#",
+            "Name",
+            "Education",
+            "Current Organization",
+            "Past Organizations",
+            "Total Experience",
+            "Relevant Experience",
+            "Highlights",
+            "Lowlights",
+            "Score",
+            "Decision",
+        ]
+    )
+    for idx, row in enumerate(results, 1):
+        current_org = str(row.get("current_organization") or "").strip()
+        writer.writerow(
+            [
+                idx,
+                row.get("name", ""),
+                fmt_education(row.get("education")),
+                current_org,
+                fmt_orgs(row.get("past_organizations"), current_org),
+                fmt_exp(row.get("total_experience")),
+                fmt_exp(row.get("relevant_experience")),
+                " | ".join(str(item) for item in row.get("highlights", [])),
+                " | ".join(str(item) for item in row.get("lowlights", [])),
+                row.get("score", ""),
+                row.get("decision", ""),
+            ]
         )
-        self._bg, self._hv = bg, hover
-        self.bind("<Enter>", lambda _: self.config(bg=self._hv))
-        self.bind("<Leave>", lambda _: self.config(bg=self._bg))
-
-
-# ─── Main application ─────────────────────────────────────────────────────────
-
-class ResumeAnalyzerApp(tk.Tk):
-    def __init__(self):
-        super().__init__()
-        self.title("Resume Analyzer — On-Prem AI HR Tool")
-        self.geometry("1320x860")
-        self.minsize(1000, 660)
-        self.configure(bg=BG)
-        self.resume_files: list[str] = []
-        self.results: list[dict] = []
-        self._apply_style()
-        self._build_ui()
-
-    # ── Style ─────────────────────────────────────────────────────────────────
-
-    def _apply_style(self):
-        s = ttk.Style(self)
-        s.theme_use("clam")
-
-        s.configure(
-            "TEntry",
-            fieldbackground="white", background="white",
-            bordercolor=BORDER, lightcolor=BORDER, darkcolor=BORDER,
-            relief="flat", padding=8, foreground=TEXT,
-        )
-        s.map(
-            "TEntry",
-            bordercolor=[("focus", ACCENT)],
-            lightcolor=[("focus", ACCENT)],
-            darkcolor=[("focus", ACCENT)],
-        )
-
-        s.configure(
-            "TCombobox",
-            fieldbackground="white", background="white",
-            bordercolor=BORDER, lightcolor=BORDER, darkcolor=BORDER,
-            relief="flat", padding=6, foreground=TEXT,
-            arrowcolor=TEXT_MUTED,
-        )
-        s.map("TCombobox",
-              fieldbackground=[("readonly", "white")],
-              bordercolor=[("focus", ACCENT)])
-
-        s.configure("Vertical.TScrollbar",
-                    troughcolor=BG, background=BORDER_DARK,
-                    bordercolor=BG, arrowcolor=TEXT_MUTED,
-                    relief="flat")
-        s.configure("Horizontal.TScrollbar",
-                    troughcolor=BG, background=BORDER_DARK,
-                    bordercolor=BG, arrowcolor=TEXT_MUTED,
-                    relief="flat")
-
-        s.configure(
-            "Results.Treeview",
-            rowheight=58, font=FONT_SMALL,
-            background="white", fieldbackground="white",
-            foreground=TEXT, bordercolor=BORDER,
-            relief="flat",
-        )
-        s.configure(
-            "Results.Treeview.Heading",
-            font=FONT_BOLD, background=PRIMARY, foreground="white",
-            relief="flat", padding=10, borderwidth=0,
-        )
-        s.map("Results.Treeview.Heading",
-              background=[("active", PRIMARY_SOFT)])
-        s.map("Results.Treeview",
-              background=[("selected", ACCENT_LIGHT)],
-              foreground=[("selected", TEXT)])
-
-        s.configure(
-            "Modern.Horizontal.TProgressbar",
-            troughcolor=BORDER, background=ACCENT,
-            bordercolor=BORDER, lightcolor=ACCENT, darkcolor=ACCENT,
-            thickness=8,
-        )
-
-    # ── Layout ────────────────────────────────────────────────────────────────
-
-    def _build_ui(self):
-        self._build_header()
-        self._build_scroll_area()
-
-        self._build_config_card()
-        self._build_jd_card()
-        self._build_resumes_card()
-        self._build_action_row()
-        self._build_results_card()
-
-        self._build_footer()
-
-    def _build_header(self):
-        hdr = tk.Frame(self, bg=PRIMARY, height=72)
-        hdr.pack(fill="x", side="top")
-        hdr.pack_propagate(False)
-
-        left = tk.Frame(hdr, bg=PRIMARY)
-        left.pack(side="left", padx=24, fill="y")
-
-        tk.Label(left, text="◆", font=(FONT_FAMILY, 22, "bold"),
-                 bg=PRIMARY, fg=ACCENT).pack(side="left", pady=18, padx=(0, 10))
-
-        title_col = tk.Frame(left, bg=PRIMARY)
-        title_col.pack(side="left", pady=14)
-        tk.Label(title_col, text="Resume Analyzer", font=FONT_TITLE,
-                 bg=PRIMARY, fg="white").pack(anchor="w")
-        tk.Label(title_col, text="On-Prem AI HR Screening · Ollama",
-                 font=FONT_SUB, bg=PRIMARY, fg=TEXT_SUBTLE).pack(anchor="w")
-
-        right = tk.Frame(hdr, bg=PRIMARY)
-        right.pack(side="right", padx=24, fill="y")
-
-        self._status_dot = tk.Label(right, text="●", font=(FONT_FAMILY, 12),
-                                    bg=PRIMARY, fg=TEXT_SUBTLE)
-        self._status_dot.pack(side="left", pady=24)
-        self._status_lbl = tk.Label(right, text="Not connected",
-                                    font=FONT_SMALL, bg=PRIMARY, fg=TEXT_SUBTLE)
-        self._status_lbl.pack(side="left", padx=(6, 0), pady=24)
-
-    def _build_scroll_area(self):
-        outer = tk.Frame(self, bg=BG)
-        outer.pack(fill="both", expand=True)
-
-        canvas = tk.Canvas(outer, bg=BG, highlightthickness=0)
-        vscroll = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
-        canvas.configure(yscrollcommand=vscroll.set)
-        vscroll.pack(side="right", fill="y")
-        canvas.pack(side="left", fill="both", expand=True)
-
-        self._main = tk.Frame(canvas, bg=BG)
-        win_id = canvas.create_window((0, 0), window=self._main, anchor="nw")
-
-        def _on_configure(_e):
-            canvas.configure(scrollregion=canvas.bbox("all"))
-        def _on_canvas_resize(e):
-            canvas.itemconfig(win_id, width=e.width)
-
-        self._main.bind("<Configure>", _on_configure)
-        canvas.bind("<Configure>", _on_canvas_resize)
-        canvas.bind_all("<MouseWheel>",
-                        lambda e: canvas.yview_scroll(-1*(e.delta//120), "units"))
-
-    def _build_footer(self):
-        ft = tk.Frame(self, bg=PRIMARY_SOFT, height=28)
-        ft.pack(fill="x", side="bottom")
-        ft.pack_propagate(False)
-        tk.Label(ft, text="On-prem · No data leaves your network",
-                 font=FONT_MICRO, bg=PRIMARY_SOFT,
-                 fg=TEXT_SUBTLE).pack(side="left", padx=24, pady=6)
-        tk.Label(ft, text="v2.0 · Ollama backend",
-                 font=FONT_MICRO, bg=PRIMARY_SOFT,
-                 fg=TEXT_SUBTLE).pack(side="right", padx=24, pady=6)
-
-    # ── Card primitives ───────────────────────────────────────────────────────
-
-    def _card(self, title: str, subtitle: str = "") -> tk.Frame:
-        # Outer creates a soft "shadow" border feel via two-tone padding
-        wrapper = tk.Frame(self._main, bg=BG)
-        wrapper.pack(fill="x", padx=24, pady=10)
-
-        outer = tk.Frame(wrapper, bg=CARD,
-                         highlightbackground=BORDER, highlightthickness=1)
-        outer.pack(fill="x")
-
-        head = tk.Frame(outer, bg=CARD)
-        head.pack(fill="x", padx=20, pady=(14, 4))
-        tk.Label(head, text=title, font=FONT_SECTION,
-                 bg=CARD, fg=TEXT).pack(anchor="w")
-        if subtitle:
-            tk.Label(head, text=subtitle, font=FONT_SMALL,
-                     bg=CARD, fg=TEXT_MUTED).pack(anchor="w", pady=(2, 0))
-
-        sep = tk.Frame(outer, bg=BORDER, height=1)
-        sep.pack(fill="x", padx=20, pady=(8, 0))
-
-        body = tk.Frame(outer, bg=CARD)
-        body.pack(fill="x", padx=20, pady=(10, 16))
-        return body
-
-    def _label(self, parent, text):
-        return tk.Label(parent, text=text, font=FONT_LABEL,
-                        bg=CARD, fg=TEXT_MUTED)
-
-    # ── Config card (Ollama) ──────────────────────────────────────────────────
-
-    def _build_config_card(self):
-        body = self._card(
-            "Ollama Connection",
-            "Configure the on-prem Ollama endpoint serving your enterprise LLM.",
-        )
-
-        grid = tk.Frame(body, bg=CARD)
-        grid.pack(fill="x")
-
-        # Row 1: host, port, test
-        self._label(grid, "HOST / IP").grid(row=0, column=0, sticky="w", padx=(0, 6))
-        self._label(grid, "PORT").grid(row=0, column=1, sticky="w", padx=6)
-        self._label(grid, "MODEL").grid(row=0, column=2, sticky="w", padx=6)
-
-        self.host_var  = tk.StringVar(value="localhost")
-        self.port_var  = tk.StringVar(value="11434")
-        self.model_var = tk.StringVar(value="llama3.1")
-
-        host_e = ttk.Entry(grid, textvariable=self.host_var, width=22, font=FONT_BODY)
-        host_e.grid(row=1, column=0, sticky="we", padx=(0, 6), pady=(2, 0))
-        ToolTip(host_e, "Examples:  localhost  ·  10.0.0.42  ·  ollama.intra")
-
-        port_e = ttk.Entry(grid, textvariable=self.port_var, width=8, font=FONT_BODY)
-        port_e.grid(row=1, column=1, sticky="we", padx=6, pady=(2, 0))
-        ToolTip(port_e, "Default Ollama port is 11434")
-
-        self._model_combo = ttk.Combobox(
-            grid, textvariable=self.model_var, font=FONT_BODY,
-            values=["llama3.1", "llama3", "mistral", "qwen2.5", "phi3"],
-            width=24,
-        )
-        self._model_combo.grid(row=1, column=2, sticky="we", padx=6, pady=(2, 0))
-        ToolTip(self._model_combo, "Type the exact model name pulled in Ollama,\n"
-                                   "or click Refresh to fetch the list.")
-
-        btns = tk.Frame(grid, bg=CARD)
-        btns.grid(row=1, column=3, sticky="w", padx=(10, 0), pady=(2, 0))
-
-        HoverButton(btns, "↻  Refresh Models",
-                    self._refresh_models, bg=NEUTRAL_BTN, fg=TEXT,
-                    hover=NEUTRAL_HOVER, font=FONT_SMALL,
-                    padx=10, pady=6).pack(side="left", padx=(0, 6))
-        HoverButton(btns, "✓  Test Connection",
-                    self._test_connection, bg=ACCENT, hover=ACCENT_HOVER,
-                    font=FONT_BOLD, padx=14, pady=6).pack(side="left")
-
-        for col, w in enumerate([3, 1, 3, 4]):
-            grid.grid_columnconfigure(col, weight=w)
-
-        # Hint line
-        hint = tk.Frame(body, bg=CARD)
-        hint.pack(fill="x", pady=(12, 0))
-        tk.Label(hint, text="🔒",
-                 font=(FONT_FAMILY, 10), bg=CARD,
-                 fg=ACCENT).pack(side="left", padx=(0, 6))
-        tk.Label(hint,
-                 text="All inference happens inside your network. "
-                      "No API keys, no external calls.",
-                 font=FONT_SMALL, bg=CARD,
-                 fg=TEXT_MUTED).pack(side="left")
-
-    # ── JD card ───────────────────────────────────────────────────────────────
-
-    def _build_jd_card(self):
-        body = self._card(
-            "Job Description",
-            "Pick the role spec to evaluate every resume against.",
-        )
-
-        row = tk.Frame(body, bg=CARD)
-        row.pack(fill="x")
-
-        self.jd_var = tk.StringVar()
-        jd_entry = ttk.Entry(row, textvariable=self.jd_var, font=FONT_BODY)
-        jd_entry.pack(side="left", fill="x", expand=True, padx=(0, 10), ipady=2)
-        ToolTip(jd_entry, "Supported formats: PDF · DOCX · PPTX · TXT")
-
-        HoverButton(row, "📂  Browse File", self._browse_jd,
-                    bg=NEUTRAL_BTN, fg=TEXT, hover=NEUTRAL_HOVER,
-                    font=FONT_BOLD, padx=14, pady=7).pack(side="left")
-
-    # ── Resumes card ──────────────────────────────────────────────────────────
-
-    def _build_resumes_card(self):
-        body = self._card(
-            "Resumes",
-            "Add the candidate documents you want to screen.",
-        )
-
-        btn_row = tk.Frame(body, bg=CARD)
-        btn_row.pack(fill="x", pady=(0, 10))
-
-        HoverButton(btn_row, "＋  Add Resumes", self._add_resumes,
-                    bg=ACCENT, hover=ACCENT_HOVER,
-                    font=FONT_BOLD, padx=14, pady=7).pack(side="left", padx=(0, 8))
-        HoverButton(btn_row, "−  Remove Selected", self._remove_selected,
-                    bg=NEUTRAL_BTN, fg=TEXT, hover=NEUTRAL_HOVER,
-                    font=FONT_SMALL, padx=12, pady=7).pack(side="left", padx=(0, 8))
-        HoverButton(btn_row, "✕  Clear All", self._clear_resumes,
-                    bg=NEUTRAL_BTN, fg=TEXT, hover=NEUTRAL_HOVER,
-                    font=FONT_SMALL, padx=12, pady=7).pack(side="left")
-
-        self._count_pill = tk.Label(
-            btn_row, text="0 files",
-            font=FONT_BOLD, bg=ACCENT_LIGHT, fg=ACCENT_DEEP,
-            padx=10, pady=4,
-        )
-        self._count_pill.pack(side="right")
-
-        list_wrap = tk.Frame(body, bg=BORDER, padx=1, pady=1)
-        list_wrap.pack(fill="x")
-        list_inner = tk.Frame(list_wrap, bg=CARD)
-        list_inner.pack(fill="both", expand=True)
-
-        self._listbox = tk.Listbox(
-            list_inner, height=6, font=FONT_BODY,
-            bg=CARD, fg=TEXT,
-            relief="flat", borderwidth=0,
-            selectmode="extended", activestyle="none",
-            selectbackground=ACCENT_LIGHT, selectforeground=TEXT,
-            highlightthickness=0,
-        )
-        sb = ttk.Scrollbar(list_inner, orient="vertical",
-                           command=self._listbox.yview)
-        self._listbox.configure(yscrollcommand=sb.set)
-        self._listbox.pack(side="left", fill="both", expand=True, padx=4, pady=4)
-        sb.pack(side="right", fill="y")
-
-    # ── Action row ────────────────────────────────────────────────────────────
-
-    def _build_action_row(self):
-        wrapper = tk.Frame(self._main, bg=BG)
-        wrapper.pack(fill="x", padx=24, pady=(4, 10))
-
-        card = tk.Frame(wrapper, bg=CARD,
-                        highlightbackground=BORDER, highlightthickness=1)
-        card.pack(fill="x")
-
-        inner = tk.Frame(card, bg=CARD)
-        inner.pack(fill="x", padx=20, pady=14)
-
-        self._analyse_btn = HoverButton(
-            inner, "▶  Run Analysis", self._start_analysis,
-            bg=ACCENT, hover=ACCENT_HOVER,
-            font=(FONT_FAMILY, 12, "bold"),
-            padx=28, pady=12,
-        )
-        self._analyse_btn.pack(side="left", padx=(0, 18))
-
-        progress_col = tk.Frame(inner, bg=CARD)
-        progress_col.pack(side="left", fill="x", expand=True)
-
-        self._progress_lbl = tk.Label(progress_col, text="Idle — ready to analyse",
-                                      font=FONT_SMALL, bg=CARD, fg=TEXT_MUTED)
-        self._progress_lbl.pack(anchor="w")
-
-        self._progress = ttk.Progressbar(
-            progress_col, mode="determinate", length=600,
-            style="Modern.Horizontal.TProgressbar",
-        )
-        self._progress.pack(anchor="w", pady=(6, 0), fill="x", expand=True)
-
-    # ── Results card ──────────────────────────────────────────────────────────
-
-    def _build_results_card(self):
-        wrapper = tk.Frame(self._main, bg=BG)
-        wrapper.pack(fill="both", expand=True, padx=24, pady=(0, 18))
-
-        card = tk.Frame(wrapper, bg=CARD,
-                        highlightbackground=BORDER, highlightthickness=1)
-        card.pack(fill="both", expand=True)
-
-        head = tk.Frame(card, bg=CARD)
-        head.pack(fill="x", padx=20, pady=(14, 4))
-        tk.Label(head, text="Analysis Results", font=FONT_SECTION,
-                 bg=CARD, fg=TEXT).pack(anchor="w")
-        tk.Label(head, text="Double-click a row to view full candidate detail.",
-                 font=FONT_SMALL, bg=CARD, fg=TEXT_MUTED).pack(anchor="w",
-                                                               pady=(2, 0))
-
-        sep = tk.Frame(card, bg=BORDER, height=1)
-        sep.pack(fill="x", padx=20, pady=(8, 0))
-
-        export_row = tk.Frame(card, bg=CARD)
-        export_row.pack(fill="x", padx=20, pady=10)
-
-        self._summary_lbl = tk.Label(
-            export_row, text="No analysis run yet",
-            font=FONT_SMALL, bg=CARD, fg=TEXT_MUTED,
-        )
-        self._summary_lbl.pack(side="left")
-
-        HoverButton(export_row, "⬇  Export Excel",
-                    self._export_excel,
-                    bg=ACCENT, hover=ACCENT_HOVER,
-                    font=FONT_BOLD, padx=14, pady=7
-                    ).pack(side="right", padx=(8, 0))
-        HoverButton(export_row, "⬇  Export CSV",
-                    self._export_csv,
-                    bg=NEUTRAL_BTN, fg=TEXT, hover=NEUTRAL_HOVER,
-                    font=FONT_SMALL, padx=12, pady=7
-                    ).pack(side="right")
-
-        cols = ("#", "Name", "Education", "Current Org.", "Past Orgs.",
-                "Total Exp.", "Relevant Exp.",
-                "Highlights", "Lowlights", "Score", "Decision")
-        widths = (40, 160, 240, 150, 220, 90, 100, 280, 220, 70, 100)
-
-        tframe = tk.Frame(card, bg=CARD)
-        tframe.pack(fill="both", expand=True, padx=20, pady=(0, 16))
-
-        self.tree = ttk.Treeview(
-            tframe, columns=cols, show="headings",
-            style="Results.Treeview", selectmode="browse",
-        )
-        for col, w in zip(cols, widths):
-            anchor = "center" if col in ("#", "Score", "Decision") else "w"
-            self.tree.heading(col, text=col)
-            self.tree.column(
-                col, width=w, anchor=anchor,
-                stretch=(col in ("Education", "Past Orgs.",
-                                 "Highlights", "Lowlights")),
-            )
-
-        vsb = ttk.Scrollbar(tframe, orient="vertical", command=self.tree.yview)
-        hsb = ttk.Scrollbar(tframe, orient="horizontal", command=self.tree.xview)
-        self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
-        self.tree.grid(row=0, column=0, sticky="nsew")
-        vsb.grid(row=0, column=1, sticky="ns")
-        hsb.grid(row=1, column=0, sticky="ew")
-        tframe.grid_rowconfigure(0, weight=1)
-        tframe.grid_columnconfigure(0, weight=1)
-
-        self.tree.tag_configure("select", background=SUCCESS_BG, foreground=TEXT)
-        self.tree.tag_configure("reject", background=DANGER_BG,  foreground=TEXT)
-        self.tree.tag_configure("even",   background=ROW_ALT)
-
-        self.tree.bind("<Double-1>", self._show_detail)
-
-    # ── Connection helpers ────────────────────────────────────────────────────
-
-    def _set_status(self, ok: bool | None, text: str):
-        color = TEXT_SUBTLE if ok is None else (
-            "#22C55E" if ok else "#EF4444"
-        )
-        self._status_dot.config(fg=color)
-        self._status_lbl.config(text=text, fg="white" if ok else TEXT_SUBTLE)
-
-    def _refresh_models(self):
-        host, port = self.host_var.get(), self.port_var.get()
+    return output.getvalue().encode("utf-8-sig")
+
+
+def _excel_bytes(results: list[dict[str, Any]]) -> bytes:
+    try:
+        import openpyxl
+        from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    except ImportError as exc:
+        raise RuntimeError("openpyxl is not installed. Install requirements.txt before exporting Excel.") from exc
+
+    workbook = openpyxl.Workbook()
+    worksheet = workbook.active
+    worksheet.title = "Resume Analysis"
+
+    header_fill = PatternFill("solid", fgColor="17211F")
+    header_font = Font(bold=True, color="FFFFFF", name="Calibri", size=11)
+    thin = Side(style="thin", color="DBE3DE")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    center = Alignment(horizontal="center", vertical="top", wrap_text=True)
+    left = Alignment(horizontal="left", vertical="top", wrap_text=True)
+
+    headers = [
+        "#",
+        "Name",
+        "Education",
+        "Current Organization",
+        "Past Organizations",
+        "Total Experience",
+        "Relevant Experience",
+        "Highlights",
+        "Lowlights",
+        "Score",
+        "Decision",
+    ]
+    for col, title in enumerate(headers, 1):
+        cell = worksheet.cell(row=1, column=col, value=title)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = center
+        cell.border = border
+
+    select_fill = PatternFill("solid", fgColor="DFF7EA")
+    reject_fill = PatternFill("solid", fgColor="FEE4E2")
+    center_cols = {1, 6, 7, 10, 11}
+
+    for row_idx, row in enumerate(results, 2):
+        current_org = str(row.get("current_organization") or "").strip()
+        is_select = str(row.get("decision", "")).lower() == "select"
+        fill = select_fill if is_select else reject_fill
+        values = [
+            row_idx - 1,
+            row.get("name", ""),
+            fmt_education(row.get("education")).replace(" | ", "\n"),
+            current_org,
+            fmt_orgs(row.get("past_organizations"), current_org).replace(", ", "\n"),
+            fmt_exp(row.get("total_experience")),
+            fmt_exp(row.get("relevant_experience")),
+            "\n".join(f"- {item}" for item in row.get("highlights", [])),
+            "\n".join(f"- {item}" for item in row.get("lowlights", [])),
+            row.get("score", ""),
+            row.get("decision", ""),
+        ]
+        for col_idx, value in enumerate(values, 1):
+            cell = worksheet.cell(row=row_idx, column=col_idx, value=value)
+            cell.fill = fill
+            cell.border = border
+            cell.alignment = center if col_idx in center_cols else left
+
+    for col, width in zip("ABCDEFGHIJK", [5, 24, 38, 24, 32, 16, 16, 42, 32, 9, 13]):
+        worksheet.column_dimensions[col].width = width
+    worksheet.freeze_panes = "A2"
+
+    buffer = io.BytesIO()
+    workbook.save(buffer)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def _form_defaults() -> dict[str, str]:
+    return {
+        "ollama_host": DEFAULT_OLLAMA_HOST,
+        "ollama_port": DEFAULT_OLLAMA_PORT,
+        "model": DEFAULT_MODEL,
+    }
+
+
+def create_app() -> Flask:
+    app = Flask(__name__)
+    app.config["MAX_CONTENT_LENGTH"] = int(os.environ.get("RESUMES_SCREENER_MAX_UPLOAD_MB", "128")) * 1024 * 1024
+    app.jinja_env.globals.update(
+        format_exp=fmt_exp,
+        format_education=fmt_education,
+        format_orgs=fmt_orgs,
+    )
+    UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
+    EXPORT_ROOT.mkdir(parents=True, exist_ok=True)
+
+    @app.get("/health")
+    def health() -> Response:
+        return jsonify({"status": "ok", "service": APP_NAME})
+
+    @app.get("/api/models")
+    def api_models() -> Response:
+        host = request.args.get("host", DEFAULT_OLLAMA_HOST)
+        port = request.args.get("port", DEFAULT_OLLAMA_PORT)
+        try:
+            port = _validate_port(port)
+        except ValueError as exc:
+            return jsonify({"ok": False, "models": [], "error": str(exc)}), 400
         models = ollama_list_models(host, port)
-        if models:
-            self._model_combo["values"] = models
-            if self.model_var.get() not in models:
-                self.model_var.set(models[0])
-            self._set_status(True, f"Connected · {len(models)} model(s)")
-            messagebox.showinfo(
-                "Models Refreshed",
-                f"Found {len(models)} model(s) on {host}:{port}:\n\n"
-                + "\n".join(f"• {m}" for m in models),
-            )
-        else:
-            self._set_status(False, "Unreachable")
-            messagebox.showwarning(
-                "No Models",
-                f"Could not reach Ollama at {host}:{port}, or no models pulled.\n\n"
-                "Verify the host/port and that `ollama serve` is running.",
-            )
+        return jsonify({"ok": bool(models), "models": models})
 
-    def _test_connection(self):
-        host, port, model = (
-            self.host_var.get(), self.port_var.get(), self.model_var.get()
-        )
+    @app.post("/api/test-connection")
+    def api_test_connection() -> Response:
+        data = request.get_json(silent=True) or request.form
+        host = str(data.get("host") or DEFAULT_OLLAMA_HOST).strip()
+        model = str(data.get("model") or DEFAULT_MODEL).strip()
+        try:
+            port = _validate_port(str(data.get("port") or DEFAULT_OLLAMA_PORT))
+        except ValueError as exc:
+            return jsonify({"ok": False, "message": str(exc)}), 400
+
         models = ollama_list_models(host, port)
         if not models:
-            self._set_status(False, "Unreachable")
-            messagebox.showerror(
-                "Connection Failed",
-                f"Cannot reach Ollama at {host}:{port}.\n\n"
-                "Check the address, firewall rules, and that the Ollama "
-                "service is running on the target host.",
-            )
-            return
+            return jsonify({"ok": False, "message": "Unreachable", "models": []}), 503
         if model not in models:
-            self._set_status(True, f"Connected · model missing")
-            messagebox.showwarning(
-                "Model Not Found",
-                f"Connected to Ollama at {host}:{port}, but model "
-                f"'{model}' is not pulled.\n\nAvailable models:\n"
-                + "\n".join(f"• {m}" for m in models)
-                + f"\n\nRun on the server:\n  ollama pull {model}",
-            )
-            return
-        self._set_status(True, f"Connected · {model}")
-        messagebox.showinfo(
-            "Connection OK",
-            f"Successfully connected to Ollama at {host}:{port}.\n\n"
-            f"Model '{model}' is ready.",
-        )
+            return jsonify({"ok": False, "message": "Model missing", "models": models}), 404
+        return jsonify({"ok": True, "message": f"Connected: {model}", "models": models})
 
-    # ── Event handlers ────────────────────────────────────────────────────────
+    @app.route("/", methods=["GET", "POST"])
+    def index() -> str | tuple[str, int]:
+        form = _form_defaults()
+        message = ""
+        message_type = ""
+        results: list[dict[str, Any]] = []
+        errors: list[dict[str, str]] = []
+        summary: dict[str, int] | None = None
+        job_id: str | None = None
 
-    def _browse_jd(self):
-        path = filedialog.askopenfilename(
-            title="Select Job Description File",
-            filetypes=[("Supported Documents",
-                        "*.pdf *.doc *.docx *.ppt *.pptx *.txt"),
-                       ("All files", "*.*")],
-        )
-        if path:
-            self.jd_var.set(path)
-
-    def _add_resumes(self):
-        paths = filedialog.askopenfilenames(
-            title="Select Resume Files",
-            filetypes=[("Supported Documents",
-                        "*.pdf *.doc *.docx *.ppt *.pptx *.txt"),
-                       ("All files", "*.*")],
-        )
-        for p in paths:
-            if p not in self.resume_files:
-                self.resume_files.append(p)
-                self._listbox.insert("end", "  " + os.path.basename(p))
-        self._update_count()
-
-    def _clear_resumes(self):
-        self.resume_files.clear()
-        self._listbox.delete(0, "end")
-        self._update_count()
-
-    def _remove_selected(self):
-        for idx in reversed(self._listbox.curselection()):
-            self._listbox.delete(idx)
-            self.resume_files.pop(idx)
-        self._update_count()
-
-    def _update_count(self):
-        n = len(self.resume_files)
-        self._count_pill.config(text=f"{n} file{'s' if n != 1 else ''}")
-
-    def _validate(self) -> bool:
-        if not self.host_var.get().strip():
-            messagebox.showwarning("Missing Input", "Please enter the Ollama host or IP.")
-            return False
-        if not self.port_var.get().strip().isdigit():
-            messagebox.showwarning("Invalid Input", "Port must be a number.")
-            return False
-        if not self.model_var.get().strip():
-            messagebox.showwarning("Missing Input", "Please enter the Ollama model name.")
-            return False
-        if not self.jd_var.get():
-            messagebox.showwarning("Missing Input", "Please select a Job Description file.")
-            return False
-        if not os.path.isfile(self.jd_var.get()):
-            messagebox.showwarning("File Not Found",
-                                   f"Job Description file not found:\n{self.jd_var.get()}")
-            return False
-        if not self.resume_files:
-            messagebox.showwarning("Missing Input",
-                                   "Please add at least one resume file.")
-            return False
-        return True
-
-    def _start_analysis(self):
-        if not self._validate():
-            return
-        self._analyse_btn.config(state="disabled")
-        self.results.clear()
-        for iid in self.tree.get_children():
-            self.tree.delete(iid)
-        self._summary_lbl.config(text="Analysis in progress…")
-        threading.Thread(target=self._run_analysis, daemon=True).start()
-
-    def _run_analysis(self):
-        try:
-            jd_text = extract_text(self.jd_var.get())
-            host    = self.host_var.get().strip()
-            port    = self.port_var.get().strip()
-            model   = self.model_var.get().strip()
-            total   = len(self.resume_files)
-
-            for i, path in enumerate(self.resume_files):
-                fname = os.path.basename(path)
-                self._update_progress(i, total, f"Analysing  {fname}  …")
-                try:
-                    result = analyse_resume(path, jd_text, host, port, model)
-                    result["_file"] = fname
-                    self.results.append(result)
-                    self._append_row(len(self.results), result)
-                except json.JSONDecodeError as exc:
-                    self._err(fname, f"Model returned invalid JSON.\n\nDetails: {exc}")
-                except Exception as exc:
-                    self._err(fname, str(exc))
-
-            self._update_progress(total, total,
-                                  f"Complete — {total} resume(s) analysed.")
-            sel  = sum(1 for r in self.results
-                       if str(r.get("decision", "")).strip().lower() == "select")
-            rej  = len(self.results) - sel
-            self.after(0, lambda: self._summary_lbl.config(
-                text=f"{len(self.results)} analysed  ·  "
-                     f"{sel} selected  ·  {rej} rejected"
-            ))
-        finally:
-            self.after(0, lambda: self._analyse_btn.config(state="normal"))
-
-    def _update_progress(self, current: int, total: int, msg: str):
-        pct = (current / total * 100) if total else 0
-        def _do():
-            self._progress.config(value=pct)
-            self._progress_lbl.config(text=msg)
-        self.after(0, _do)
-
-    def _append_row(self, serial: int, r: dict):
-        highlights = "  •  ".join(r.get("highlights", []))
-        lowlights  = "  •  ".join(r.get("lowlights",  []))
-        score      = r.get("score", 0)
-        decision   = r.get("decision", "Reject")
-        tag        = "select" if str(decision).strip().lower() == "select" else "reject"
-
-        current_org = str(r.get("current_organization") or "").strip() or "—"
-
-        values = (
-            serial,
-            r.get("name", "Unknown"),
-            fmt_education(r.get("education")),
-            current_org,
-            fmt_orgs(r.get("past_organizations"), exclude=current_org),
-            fmt_exp(r.get("total_experience")),
-            fmt_exp(r.get("relevant_experience")),
-            highlights,
-            lowlights,
-            f"{score} / 10",
-            "✓ " + decision if tag == "select" else "✕ " + decision,
-        )
-        self.after(0, lambda v=values, t=tag: self.tree.insert("", "end", values=v, tags=(t,)))
-
-    def _err(self, fname: str, msg: str):
-        self.after(0, lambda: messagebox.showerror(
-            "Analysis Error", f"Failed to analyse:\n{fname}\n\n{msg}"
-        ))
-
-    # ── Detail popup ──────────────────────────────────────────────────────────
-
-    def _show_detail(self, _event=None):
-        sel = self.tree.selection()
-        if not sel:
-            return
-        idx = self.tree.index(sel[0])
-        if idx >= len(self.results):
-            return
-        r = self.results[idx]
-
-        win = tk.Toplevel(self)
-        win.title(f"Detail — {r.get('name', 'Unknown')}")
-        win.geometry("760x780")
-        win.configure(bg=BG)
-        win.grab_set()
-        win.resizable(True, True)
-
-        # Header
-        hdr = tk.Frame(win, bg=PRIMARY, height=66)
-        hdr.pack(fill="x")
-        hdr.pack_propagate(False)
-
-        hdr_inner = tk.Frame(hdr, bg=PRIMARY)
-        hdr_inner.pack(side="left", padx=24, pady=12)
-        tk.Label(hdr_inner, text=r.get("name", "Unknown"),
-                 font=(FONT_FAMILY, 15, "bold"),
-                 bg=PRIMARY, fg="white").pack(anchor="w")
-        tk.Label(hdr_inner, text=r.get("_file", ""),
-                 font=FONT_SMALL, bg=PRIMARY, fg=TEXT_SUBTLE).pack(anchor="w")
-
-        score    = r.get("score", 0)
-        decision = r.get("decision", "Reject")
-        is_sel   = str(decision).strip().lower() == "select"
-
-        badge = tk.Frame(hdr, bg=PRIMARY)
-        badge.pack(side="right", padx=24, pady=14)
-        tk.Label(
-            badge,
-            text=("✓ " if is_sel else "✕ ") + decision,
-            font=FONT_BOLD,
-            bg=SUCCESS_BG if is_sel else DANGER_BG,
-            fg=SUCCESS if is_sel else DANGER,
-            padx=14, pady=6,
-        ).pack(side="right")
-
-        # Body
-        body = tk.Frame(win, bg=BG)
-        body.pack(fill="both", expand=True, padx=20, pady=16)
-
-        # Stat row
-        stats = tk.Frame(body, bg=BG)
-        stats.pack(fill="x", pady=(0, 14))
-
-        def stat(parent, label, value, fg=TEXT):
-            box = tk.Frame(parent, bg=CARD,
-                           highlightbackground=BORDER, highlightthickness=1)
-            box.pack(side="left", fill="x", expand=True, padx=(0, 10))
-            tk.Label(box, text=label, font=FONT_LABEL,
-                     bg=CARD, fg=TEXT_MUTED).pack(anchor="w", padx=14, pady=(10, 0))
-            tk.Label(box, text=value, font=(FONT_FAMILY, 14, "bold"),
-                     bg=CARD, fg=fg).pack(anchor="w", padx=14, pady=(0, 10))
-
-        stat(stats, "TOTAL EXPERIENCE",    fmt_exp(r.get("total_experience")))
-        stat(stats, "RELEVANT EXPERIENCE", fmt_exp(r.get("relevant_experience")))
-        stat(stats, "MATCH SCORE", f"{score} / 10",
-             fg=SUCCESS if is_sel else DANGER)
-
-        def section(title: str, items, color):
-            wrap = tk.Frame(body, bg=CARD,
-                            highlightbackground=BORDER, highlightthickness=1)
-            wrap.pack(fill="x", pady=(0, 10))
-            head = tk.Frame(wrap, bg=CARD)
-            head.pack(fill="x", padx=14, pady=(10, 4))
-            tk.Label(head, text=title, font=FONT_BOLD,
-                     bg=CARD, fg=color).pack(anchor="w")
-            for it in (items or ["—"]):
-                row = tk.Frame(wrap, bg=CARD)
-                row.pack(fill="x", padx=14, pady=2)
-                tk.Label(row, text="•", font=FONT_BOLD,
-                         bg=CARD, fg=color).pack(side="left", padx=(0, 6))
-                tk.Label(row, text=it, font=FONT_BODY, bg=CARD, fg=TEXT,
-                         wraplength=640, justify="left",
-                         anchor="w").pack(side="left", fill="x", expand=True)
-            tk.Frame(wrap, bg=CARD, height=8).pack()
-
-        # Profile card: education + organisations
-        edu_lines = []
-        seen = set()
-        for e in (r.get("education") or []):
-            if not isinstance(e, dict):
-                continue
-            deg  = str(e.get("degree", "") or "").strip()
-            coll = str(e.get("college", "") or "").strip()
-            yr   = e.get("year")
-            yr_s = str(int(yr)) if isinstance(yr, (int, float)) and yr else (
-                str(yr).strip() if yr else ""
-            )
-            parts = [p for p in (deg, coll, yr_s) if p]
-            if not parts:
-                continue
-            line = ", ".join(parts)
-            k = line.lower()
-            if k in seen:
-                continue
-            seen.add(k)
-            edu_lines.append(line)
-
-        current_org = str(r.get("current_organization") or "").strip()
-        past_orgs_raw = r.get("past_organizations") or []
-        past_orgs = []
-        seen_o = set()
-        excl = current_org.lower()
-        for o in past_orgs_raw:
-            s = str(o or "").strip()
-            if not s:
-                continue
-            k = s.lower()
-            if k in seen_o or k == excl:
-                continue
-            seen_o.add(k)
-            past_orgs.append(s)
-
-        prof = tk.Frame(body, bg=CARD,
-                        highlightbackground=BORDER, highlightthickness=1)
-        prof.pack(fill="x", pady=(0, 10))
-        tk.Label(prof, text="Profile", font=FONT_BOLD,
-                 bg=CARD, fg=TEXT).pack(anchor="w", padx=14, pady=(10, 4))
-
-        def info_row(label: str, value: str, mono: bool = False):
-            row = tk.Frame(prof, bg=CARD)
-            row.pack(fill="x", padx=14, pady=3)
-            tk.Label(row, text=label, font=FONT_LABEL,
-                     bg=CARD, fg=TEXT_MUTED, width=12,
-                     anchor="w").pack(side="left")
-            tk.Label(row, text=value or "—",
-                     font=FONT_BODY, bg=CARD, fg=TEXT,
-                     wraplength=560, justify="left",
-                     anchor="w").pack(side="left", fill="x", expand=True)
-
-        info_row("EDUCATION",
-                 "\n".join(edu_lines) if edu_lines else "—")
-        info_row("CURRENT ORG", current_org)
-        info_row("PAST ORGS",
-                 ", ".join(past_orgs) if past_orgs else "—")
-        tk.Frame(prof, bg=CARD, height=8).pack()
-
-        section("Strengths",  r.get("highlights"), SUCCESS)
-        section("Concerns",   r.get("lowlights"),  DANGER)
-
-        footer = tk.Frame(win, bg=BG)
-        footer.pack(fill="x", padx=20, pady=(0, 16))
-        HoverButton(footer, "Close", win.destroy,
-                    bg=NEUTRAL_BTN, fg=TEXT, hover=NEUTRAL_HOVER,
-                    font=FONT_BOLD, padx=20, pady=8).pack(side="right")
-
-    # ── Export ────────────────────────────────────────────────────────────────
-
-    def _export_csv(self):
-        if not self.results:
-            messagebox.showinfo("No Data", "Run the analysis first.")
-            return
-        path = filedialog.asksaveasfilename(
-            defaultextension=".csv",
-            filetypes=[("CSV Files", "*.csv")],
-            initialfile="resume_analysis",
-        )
-        if not path:
-            return
-        import csv
-        with open(path, "w", newline="", encoding="utf-8-sig") as f:
-            w = csv.writer(f)
-            w.writerow([
-                "#", "Name", "Education", "Current Organization",
-                "Past Organizations", "Total Experience", "Relevant Experience",
-                "Highlights", "Lowlights", "Score", "Decision",
-            ])
-            for i, r in enumerate(self.results, 1):
-                current_org = str(r.get("current_organization") or "").strip()
-                w.writerow([
-                    i, r.get("name", ""),
-                    fmt_education(r.get("education")),
-                    current_org,
-                    fmt_orgs(r.get("past_organizations"), exclude=current_org),
-                    fmt_exp(r.get("total_experience")),
-                    fmt_exp(r.get("relevant_experience")),
-                    " | ".join(r.get("highlights", [])),
-                    " | ".join(r.get("lowlights", [])),
-                    r.get("score", ""),
-                    r.get("decision", ""),
-                ])
-        messagebox.showinfo("Exported", f"CSV saved to:\n{path}")
-
-    def _export_excel(self):
-        if not self.results:
-            messagebox.showinfo("No Data", "Run the analysis first.")
-            return
-        try:
-            import openpyxl
-            from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
-        except ImportError:
-            messagebox.showerror("Error",
-                                 "openpyxl not available. Please use CSV export.")
-            return
-
-        path = filedialog.asksaveasfilename(
-            defaultextension=".xlsx",
-            filetypes=[("Excel Files", "*.xlsx")],
-            initialfile="resume_analysis",
-        )
-        if not path:
-            return
-
-        wb = openpyxl.Workbook()
-        ws = wb.active
-        ws.title = "Resume Analysis"
-
-        h_fill   = PatternFill("solid", fgColor="0F172A")
-        h_font   = Font(bold=True, color="FFFFFF", name="Calibri", size=11)
-        thin     = Side(style="thin", color="E2E8F0")
-        border   = Border(left=thin, right=thin, top=thin, bottom=thin)
-        c_align  = Alignment(horizontal="center", vertical="top", wrap_text=True)
-        l_align  = Alignment(horizontal="left",   vertical="top", wrap_text=True)
-
-        headers  = ["#", "Name", "Education", "Current Organization",
-                    "Past Organizations", "Total Experience", "Relevant Experience",
-                    "Highlights", "Lowlights", "Score", "Decision"]
-        for col, h in enumerate(headers, 1):
-            cell           = ws.cell(row=1, column=col, value=h)
-            cell.fill      = h_fill
-            cell.font      = h_font
-            cell.alignment = c_align
-            cell.border    = border
-
-        sel_fill = PatternFill("solid", fgColor="D1FAE5")
-        rej_fill = PatternFill("solid", fgColor="FEE2E2")
-        alt_fill = PatternFill("solid", fgColor="F8FAFC")
-
-        # Columns to center-align (1-indexed): #, Total Exp, Rel Exp, Score, Decision
-        center_cols = {1, 6, 7, 10, 11}
-
-        for ri, r in enumerate(self.results, 2):
-            decision = str(r.get("decision", "Reject")).strip().lower()
-            if decision == "select":
-                row_fill = sel_fill
-            elif ri % 2 == 0:
-                row_fill = alt_fill
-            else:
-                row_fill = rej_fill
-
-            current_org = str(r.get("current_organization") or "").strip()
-            # Education: each entry on its own line for readability
-            edu_lines, seen = [], set()
-            for e in (r.get("education") or []):
-                if not isinstance(e, dict):
-                    continue
-                deg  = str(e.get("degree", "") or "").strip()
-                coll = str(e.get("college", "") or "").strip()
-                yr   = e.get("year")
-                yr_s = str(int(yr)) if isinstance(yr, (int, float)) and yr else (
-                    str(yr).strip() if yr else ""
+        if request.method == "POST":
+            form = {
+                "ollama_host": request.form.get("ollama_host", DEFAULT_OLLAMA_HOST).strip(),
+                "ollama_port": request.form.get("ollama_port", DEFAULT_OLLAMA_PORT).strip(),
+                "model": request.form.get("model", DEFAULT_MODEL).strip(),
+            }
+            try:
+                payload = _handle_analysis_request(form)
+                results = payload["results"]
+                errors = payload["errors"]
+                summary = payload["summary"]
+                job_id = payload["job_id"]
+                message = "Analysis complete."
+                message_type = "ok"
+            except ValueError as exc:
+                message = str(exc)
+                message_type = "error"
+                return (
+                    render_template(
+                        "index.html",
+                        app_name=APP_NAME,
+                        org_name=ORG_NAME,
+                        form=form,
+                        known_models=[DEFAULT_MODEL],
+                        message=message,
+                        message_type=message_type,
+                        results=results,
+                        errors=errors,
+                        summary=summary,
+                        insights=_view_insights(results, errors),
+                        job_id=job_id,
+                    ),
+                    400,
                 )
-                parts = [p for p in (deg, coll, yr_s) if p]
-                if not parts:
-                    continue
-                line = ", ".join(parts)
-                k = line.lower()
-                if k not in seen:
-                    seen.add(k)
-                    edu_lines.append(line)
 
-            past_lines, seen_o = [], set()
-            excl = current_org.lower()
-            for o in (r.get("past_organizations") or []):
-                s = str(o or "").strip()
-                if not s:
-                    continue
-                k = s.lower()
-                if k in seen_o or k == excl:
-                    continue
-                seen_o.add(k)
-                past_lines.append(s)
+        return render_template(
+            "index.html",
+            app_name=APP_NAME,
+            org_name=ORG_NAME,
+            form=form,
+            known_models=[DEFAULT_MODEL, "llama3", "mistral", "qwen2.5", "phi3"],
+            message=message,
+            message_type=message_type,
+            results=results,
+            errors=errors,
+            summary=summary,
+            insights=_view_insights(results, errors),
+            job_id=job_id,
+        )
 
-            values = [
-                ri - 1,
-                r.get("name", ""),
-                "\n".join(edu_lines) if edu_lines else "",
-                current_org,
-                "\n".join(past_lines) if past_lines else "",
-                fmt_exp(r.get("total_experience")),
-                fmt_exp(r.get("relevant_experience")),
-                "\n".join(f"• {h}" for h in r.get("highlights", [])),
-                "\n".join(f"• {l}" for l in r.get("lowlights",  [])),
-                r.get("score", ""),
-                r.get("decision", ""),
-            ]
-            for ci, val in enumerate(values, 1):
-                cell           = ws.cell(row=ri, column=ci, value=val)
-                cell.fill      = row_fill
-                cell.border    = border
-                cell.alignment = c_align if ci in center_cols else l_align
+    @app.post("/api/analyze")
+    def api_analyze() -> Response:
+        form = {
+            "ollama_host": request.form.get("ollama_host") or request.form.get("host") or DEFAULT_OLLAMA_HOST,
+            "ollama_port": request.form.get("ollama_port") or request.form.get("port") or DEFAULT_OLLAMA_PORT,
+            "model": request.form.get("model") or DEFAULT_MODEL,
+        }
+        try:
+            payload = _handle_analysis_request(form)
+        except ValueError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 400
+        return jsonify(
+            {
+                "ok": not payload["errors"],
+                "job_id": payload["job_id"],
+                "summary": payload["summary"],
+                "results": payload["results"],
+                "errors": payload["errors"],
+                "downloads": {
+                    "csv": url_for("download_csv", job_id=payload["job_id"], _external=True),
+                    "excel": url_for("download_excel", job_id=payload["job_id"], _external=True),
+                },
+            }
+        )
 
-        for col, width in zip(
-            "ABCDEFGHIJK",
-            [5, 24, 36, 24, 32, 16, 16, 42, 32, 9, 13],
-        ):
-            ws.column_dimensions[col].width = width
+    @app.get("/download/<job_id>.csv")
+    def download_csv(job_id: str) -> Response:
+        payload = _load_job(job_id)
+        data = _csv_bytes(payload.get("results", []))
+        return send_file(
+            io.BytesIO(data),
+            mimetype="text/csv",
+            as_attachment=True,
+            download_name=f"resume_analysis_{job_id}.csv",
+        )
 
-        ws.freeze_panes = "A2"
+    @app.get("/download/<job_id>.xlsx")
+    def download_excel(job_id: str) -> Response:
+        payload = _load_job(job_id)
+        try:
+            data = _excel_bytes(payload.get("results", []))
+        except RuntimeError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 500
+        return send_file(
+            io.BytesIO(data),
+            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            as_attachment=True,
+            download_name=f"resume_analysis_{job_id}.xlsx",
+        )
 
-        wb.save(path)
-        messagebox.showinfo("Exported", f"Excel file saved to:\n{path}")
+    def _handle_analysis_request(form: dict[str, str]) -> dict[str, Any]:
+        host = str(form.get("ollama_host") or DEFAULT_OLLAMA_HOST).strip()
+        port = _validate_port(str(form.get("ollama_port") or DEFAULT_OLLAMA_PORT))
+        model = str(form.get("model") or DEFAULT_MODEL).strip()
+        if not host:
+            raise ValueError("Host / IP is required.")
+        if not model:
+            raise ValueError("Model is required.")
+
+        jd_file = request.files.get("jd_file")
+        resume_files = request.files.getlist("resumes")
+        _validate_file(jd_file, "Job description")
+        if not resume_files or not any(file.filename for file in resume_files):
+            raise ValueError("At least one resume file is required.")
+        for resume_file in resume_files:
+            _validate_file(resume_file, "Resume")
+
+        with tempfile.TemporaryDirectory(prefix="job-", dir=UPLOAD_ROOT) as work_dir_name:
+            work_dir = Path(work_dir_name)
+            assert jd_file is not None
+            jd_path = _save_upload(jd_file, work_dir)
+            resume_paths = [_save_upload(file, work_dir) for file in resume_files if file.filename]
+            results, errors = _screen_documents(jd_path, resume_paths, host, port, model)
+
+        config = {"host": host, "port": port, "model": model}
+        saved_job_id = _save_job(results, errors, config)
+        return {
+            "job_id": saved_job_id,
+            "summary": _summary(results),
+            "results": results,
+            "errors": errors,
+        }
+
+    return app
 
 
-# ─── Entry point ──────────────────────────────────────────────────────────────
+app = create_app()
 
-def main():
-    app = ResumeAnalyzerApp()
-    app.mainloop()
+
+def main() -> None:
+    host = os.environ.get("RESUMES_SCREENER_HOST", "0.0.0.0")
+    port = int(os.environ.get("RESUMES_SCREENER_PORT", "80"))
+    threads = int(os.environ.get("RESUMES_SCREENER_THREADS", "8"))
+    try:
+        from waitress import serve
+    except ImportError as exc:
+        raise SystemExit("waitress is not installed. Run: python -m pip install -r requirements.txt") from exc
+    serve(app, host=host, port=port, threads=threads)
 
 
 if __name__ == "__main__":

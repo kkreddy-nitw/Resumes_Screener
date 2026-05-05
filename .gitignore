@@ -1,0 +1,7 @@
+/.venv/
+/uploads/
+/exports/
+/logs/
+/windows_service_config.json
+__pycache__/
+*.py[cod]
