@@ -68,7 +68,11 @@ def extract_text(path: str) -> str:
 # ─── Ollama interaction ───────────────────────────────────────────────────────
 
 ANALYSIS_PROMPT = """\
-You are an expert HR analyst. Analyse the resume against the job description below.
+You are a seasoned HR analyst with more than 20 years of recruitment experience
+across the industry. You have screened thousands of resumes, interviewed candidates
+at every level, and have a sharp eye for role fit, career trajectory, and red flags.
+Apply that depth of judgement when evaluating this resume against the job description.
+
 Respond with ONLY a valid JSON object — no markdown fences, no explanation, just raw JSON.
 
 JOB DESCRIPTION:
@@ -80,6 +84,11 @@ RESUME:
 Return this exact JSON (fill in real values):
 {{
   "name": "<candidate full name>",
+  "education": [
+    {{"degree": "<e.g., B.Tech>", "college": "<e.g., NIT Warangal>", "year": <year of passing as int, e.g., 2018>}}
+  ],
+  "current_organization": "<current employer, or empty string if not currently employed>",
+  "past_organizations": ["<previous employer 1>", "<previous employer 2>"],
   "total_experience": {{"years": <int>, "months": <int 0-11>}},
   "relevant_experience": {{"years": <int>, "months": <int 0-11>}},
   "highlights": ["<strength 1>", "<strength 2>", "<strength 3>"],
@@ -89,6 +98,15 @@ Return this exact JSON (fill in real values):
 }}
 
 Rules:
+- education: include ONLY degree, college name, and year of passing.
+  Do NOT include location, GPA, percentage, specialisation, coursework, or any other detail.
+  List every distinct qualification (e.g., both B.Tech and M.Tech).
+  Do NOT repeat the same qualification more than once.
+- current_organization: the single employer the candidate works at right now.
+  Use an empty string if the candidate is not currently employed.
+- past_organizations: every prior employer in reverse chronological order (most recent first).
+  Deduplicate strictly — each company name must appear only once even if the candidate
+  worked there in multiple stints. Do NOT include the current organization in this list.
 - score is 1–10 based on how well the resume matches the job description
 - decision MUST be "Select" when score > 6, otherwise "Reject"
 - Extract the candidate name directly from the resume text
@@ -197,6 +215,50 @@ def fmt_exp(exp: dict | None) -> str:
         return "N/A"
     y, m = int(exp.get("years", 0)), int(exp.get("months", 0))
     return f"{y}y {m}m"
+
+
+def fmt_education(edu: list | None) -> str:
+    """Render education as 'Degree, College, Year' entries, deduplicated."""
+    if not edu:
+        return "—"
+    seen, out = set(), []
+    for e in edu:
+        if not isinstance(e, dict):
+            continue
+        deg  = str(e.get("degree", "") or "").strip()
+        coll = str(e.get("college", "") or "").strip()
+        yr   = e.get("year")
+        yr_s = str(int(yr)) if isinstance(yr, (int, float)) and yr else (
+            str(yr).strip() if yr else ""
+        )
+        parts = [p for p in (deg, coll, yr_s) if p]
+        if not parts:
+            continue
+        line = ", ".join(parts)
+        key = line.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(line)
+    return "  ·  ".join(out) if out else "—"
+
+
+def fmt_orgs(orgs: list | None, exclude: str = "") -> str:
+    """Comma-separated list of organizations, deduplicated, excluding `exclude`."""
+    if not orgs:
+        return "—"
+    excl = (exclude or "").strip().lower()
+    seen, out = set(), []
+    for o in orgs:
+        s = str(o or "").strip()
+        if not s:
+            continue
+        key = s.lower()
+        if key in seen or key == excl:
+            continue
+        seen.add(key)
+        out.append(s)
+    return ", ".join(out) if out else "—"
 
 
 class ToolTip:
@@ -628,9 +690,10 @@ class ResumeAnalyzerApp(tk.Tk):
                     font=FONT_SMALL, padx=12, pady=7
                     ).pack(side="right")
 
-        cols = ("#", "Name", "Total Exp.", "Relevant Exp.",
+        cols = ("#", "Name", "Education", "Current Org.", "Past Orgs.",
+                "Total Exp.", "Relevant Exp.",
                 "Highlights", "Lowlights", "Score", "Decision")
-        widths = (40, 180, 100, 110, 320, 260, 70, 100)
+        widths = (40, 160, 240, 150, 220, 90, 100, 280, 220, 70, 100)
 
         tframe = tk.Frame(card, bg=CARD)
         tframe.pack(fill="both", expand=True, padx=20, pady=(0, 16))
@@ -644,7 +707,8 @@ class ResumeAnalyzerApp(tk.Tk):
             self.tree.heading(col, text=col)
             self.tree.column(
                 col, width=w, anchor=anchor,
-                stretch=(col in ("Highlights", "Lowlights")),
+                stretch=(col in ("Education", "Past Orgs.",
+                                 "Highlights", "Lowlights")),
             )
 
         vsb = ttk.Scrollbar(tframe, orient="vertical", command=self.tree.yview)
@@ -843,9 +907,14 @@ class ResumeAnalyzerApp(tk.Tk):
         decision   = r.get("decision", "Reject")
         tag        = "select" if str(decision).strip().lower() == "select" else "reject"
 
+        current_org = str(r.get("current_organization") or "").strip() or "—"
+
         values = (
             serial,
             r.get("name", "Unknown"),
+            fmt_education(r.get("education")),
+            current_org,
+            fmt_orgs(r.get("past_organizations"), exclude=current_org),
             fmt_exp(r.get("total_experience")),
             fmt_exp(r.get("relevant_experience")),
             highlights,
@@ -873,7 +942,7 @@ class ResumeAnalyzerApp(tk.Tk):
 
         win = tk.Toplevel(self)
         win.title(f"Detail — {r.get('name', 'Unknown')}")
-        win.geometry("720x620")
+        win.geometry("760x780")
         win.configure(bg=BG)
         win.grab_set()
         win.resizable(True, True)
@@ -942,9 +1011,70 @@ class ResumeAnalyzerApp(tk.Tk):
                 tk.Label(row, text="•", font=FONT_BOLD,
                          bg=CARD, fg=color).pack(side="left", padx=(0, 6))
                 tk.Label(row, text=it, font=FONT_BODY, bg=CARD, fg=TEXT,
-                         wraplength=620, justify="left",
+                         wraplength=640, justify="left",
                          anchor="w").pack(side="left", fill="x", expand=True)
             tk.Frame(wrap, bg=CARD, height=8).pack()
+
+        # Profile card: education + organisations
+        edu_lines = []
+        seen = set()
+        for e in (r.get("education") or []):
+            if not isinstance(e, dict):
+                continue
+            deg  = str(e.get("degree", "") or "").strip()
+            coll = str(e.get("college", "") or "").strip()
+            yr   = e.get("year")
+            yr_s = str(int(yr)) if isinstance(yr, (int, float)) and yr else (
+                str(yr).strip() if yr else ""
+            )
+            parts = [p for p in (deg, coll, yr_s) if p]
+            if not parts:
+                continue
+            line = ", ".join(parts)
+            k = line.lower()
+            if k in seen:
+                continue
+            seen.add(k)
+            edu_lines.append(line)
+
+        current_org = str(r.get("current_organization") or "").strip()
+        past_orgs_raw = r.get("past_organizations") or []
+        past_orgs = []
+        seen_o = set()
+        excl = current_org.lower()
+        for o in past_orgs_raw:
+            s = str(o or "").strip()
+            if not s:
+                continue
+            k = s.lower()
+            if k in seen_o or k == excl:
+                continue
+            seen_o.add(k)
+            past_orgs.append(s)
+
+        prof = tk.Frame(body, bg=CARD,
+                        highlightbackground=BORDER, highlightthickness=1)
+        prof.pack(fill="x", pady=(0, 10))
+        tk.Label(prof, text="Profile", font=FONT_BOLD,
+                 bg=CARD, fg=TEXT).pack(anchor="w", padx=14, pady=(10, 4))
+
+        def info_row(label: str, value: str, mono: bool = False):
+            row = tk.Frame(prof, bg=CARD)
+            row.pack(fill="x", padx=14, pady=3)
+            tk.Label(row, text=label, font=FONT_LABEL,
+                     bg=CARD, fg=TEXT_MUTED, width=12,
+                     anchor="w").pack(side="left")
+            tk.Label(row, text=value or "—",
+                     font=FONT_BODY, bg=CARD, fg=TEXT,
+                     wraplength=560, justify="left",
+                     anchor="w").pack(side="left", fill="x", expand=True)
+
+        info_row("EDUCATION",
+                 "\n".join(edu_lines) if edu_lines else "—")
+        info_row("CURRENT ORG", current_org)
+        info_row("PAST ORGS",
+                 ", ".join(past_orgs) if past_orgs else "—")
+        tk.Frame(prof, bg=CARD, height=8).pack()
 
         section("Strengths",  r.get("highlights"), SUCCESS)
         section("Concerns",   r.get("lowlights"),  DANGER)
@@ -971,11 +1101,18 @@ class ResumeAnalyzerApp(tk.Tk):
         import csv
         with open(path, "w", newline="", encoding="utf-8-sig") as f:
             w = csv.writer(f)
-            w.writerow(["#", "Name", "Total Experience", "Relevant Experience",
-                        "Highlights", "Lowlights", "Score", "Decision"])
+            w.writerow([
+                "#", "Name", "Education", "Current Organization",
+                "Past Organizations", "Total Experience", "Relevant Experience",
+                "Highlights", "Lowlights", "Score", "Decision",
+            ])
             for i, r in enumerate(self.results, 1):
+                current_org = str(r.get("current_organization") or "").strip()
                 w.writerow([
                     i, r.get("name", ""),
+                    fmt_education(r.get("education")),
+                    current_org,
+                    fmt_orgs(r.get("past_organizations"), exclude=current_org),
                     fmt_exp(r.get("total_experience")),
                     fmt_exp(r.get("relevant_experience")),
                     " | ".join(r.get("highlights", [])),
@@ -1016,7 +1153,8 @@ class ResumeAnalyzerApp(tk.Tk):
         c_align  = Alignment(horizontal="center", vertical="top", wrap_text=True)
         l_align  = Alignment(horizontal="left",   vertical="top", wrap_text=True)
 
-        headers  = ["#", "Name", "Total Experience", "Relevant Experience",
+        headers  = ["#", "Name", "Education", "Current Organization",
+                    "Past Organizations", "Total Experience", "Relevant Experience",
                     "Highlights", "Lowlights", "Score", "Decision"]
         for col, h in enumerate(headers, 1):
             cell           = ws.cell(row=1, column=col, value=h)
@@ -1029,6 +1167,9 @@ class ResumeAnalyzerApp(tk.Tk):
         rej_fill = PatternFill("solid", fgColor="FEE2E2")
         alt_fill = PatternFill("solid", fgColor="F8FAFC")
 
+        # Columns to center-align (1-indexed): #, Total Exp, Rel Exp, Score, Decision
+        center_cols = {1, 6, 7, 10, 11}
+
         for ri, r in enumerate(self.results, 2):
             decision = str(r.get("decision", "Reject")).strip().lower()
             if decision == "select":
@@ -1038,9 +1179,45 @@ class ResumeAnalyzerApp(tk.Tk):
             else:
                 row_fill = rej_fill
 
+            current_org = str(r.get("current_organization") or "").strip()
+            # Education: each entry on its own line for readability
+            edu_lines, seen = [], set()
+            for e in (r.get("education") or []):
+                if not isinstance(e, dict):
+                    continue
+                deg  = str(e.get("degree", "") or "").strip()
+                coll = str(e.get("college", "") or "").strip()
+                yr   = e.get("year")
+                yr_s = str(int(yr)) if isinstance(yr, (int, float)) and yr else (
+                    str(yr).strip() if yr else ""
+                )
+                parts = [p for p in (deg, coll, yr_s) if p]
+                if not parts:
+                    continue
+                line = ", ".join(parts)
+                k = line.lower()
+                if k not in seen:
+                    seen.add(k)
+                    edu_lines.append(line)
+
+            past_lines, seen_o = [], set()
+            excl = current_org.lower()
+            for o in (r.get("past_organizations") or []):
+                s = str(o or "").strip()
+                if not s:
+                    continue
+                k = s.lower()
+                if k in seen_o or k == excl:
+                    continue
+                seen_o.add(k)
+                past_lines.append(s)
+
             values = [
                 ri - 1,
                 r.get("name", ""),
+                "\n".join(edu_lines) if edu_lines else "",
+                current_org,
+                "\n".join(past_lines) if past_lines else "",
                 fmt_exp(r.get("total_experience")),
                 fmt_exp(r.get("relevant_experience")),
                 "\n".join(f"• {h}" for h in r.get("highlights", [])),
@@ -1052,9 +1229,12 @@ class ResumeAnalyzerApp(tk.Tk):
                 cell           = ws.cell(row=ri, column=ci, value=val)
                 cell.fill      = row_fill
                 cell.border    = border
-                cell.alignment = c_align if ci in (1, 3, 4, 7, 8) else l_align
+                cell.alignment = c_align if ci in center_cols else l_align
 
-        for col, width in zip("ABCDEFGH", [5, 26, 18, 18, 46, 36, 9, 13]):
+        for col, width in zip(
+            "ABCDEFGHIJK",
+            [5, 24, 36, 24, 32, 16, 16, 42, 32, 9, 13],
+        ):
             ws.column_dimensions[col].width = width
 
         ws.freeze_panes = "A2"
